@@ -5,16 +5,16 @@ import {estimateRun,reportedUsage} from './model-policy.js';
 import {initial} from './state.js';
 import {revisionHistoryValid} from './revisions.js';
 import {projectHierarchyValid} from './projects.js';
-import {parseJsonObject,responseFormatValid} from './structured.js';
+import {parseJsonObject,responseFormatValid,responseSchema} from './structured.js';
 import {notebookValid} from './notebooks.js';
 import {seal, unseal} from './vault.js';
-import {authenticate,authenticatedOwner} from './auth.js';
+import {authConfig,authenticate,authenticatedOwner,completeAuth,startGoogle} from './auth.js';
 import {collaboration} from './collaboration.js';
 import {notebookAvailable,notebookCall} from './notebooklm.js';
 import {voiceRequest} from './voice.js';
 import {mediaRequest} from './media.js';
 import {decideWithJev} from './decision-service.js';
-import {apiKeyOwner,changeJob,createApiKey,createShare,enqueueJob,getJob,listApiKeys,listJobs,listShares,loadWorkspace,replayJob,revokeApiKey,revokeShare,setSchedule,sharedSnapshot,tickJobs} from './jobs.js';
+import {apiKeyOwner,changeJob,createApiKey,createShare,enqueueJob,getJob,listApiKeys,listJobs,listShares,loadWorkspace,replayJob,revokeApiKey,revokeShare,runIdFor,setSchedule,sharedSnapshot,tickJobs} from './jobs.js';
 
 const noCache={'cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'};
 class Problem extends Error { constructor(status,message){super(message);this.status=status;} }
@@ -70,10 +70,10 @@ function workspaceValid(s) {
 }
 async function ownerOf(request,env) {
   if(env.LOCAL_USER) return {id:'local-owner',email:'Local workspace',local:true};
-  if(env.KAPRON_SUPABASE_URL){
+  if(authConfig(env).mode==='email'){
     const owner=await authenticatedOwner(request,env);
     if(owner)return owner;
-    throw new Problem(401,'Sign in to open your workspace.');
+    throw Object.assign(new Problem(401,'Sign in to open your workspace.'),{needsSession:true});
   }
   if(env.KAPRON_TRUST_SITES_IDENTITY!=='1')throw new Problem(503,'Authentication is not configured.');
   const id=request.headers.get('oai-authenticated-user-id');
@@ -177,6 +177,8 @@ function streamResponse(iterator,abort) {
 async function run(request,env,owner) {
   const input=await readJson(request,250000);
   validateRun(input);
+  const schema=input.options?.responseFormat==='json_object'?responseSchema(input.options?.responseSchema):undefined;
+  if(input.connectionId==='demo'&&schema)throw new Problem(400,'Select a connected model for a custom response schema.');
   const abort=new AbortController();
   const timeout=setTimeout(()=>abort.abort(),110000);
   const stop=()=>{clearTimeout(timeout);request.signal.removeEventListener('abort',stop);abort.abort();};
@@ -232,7 +234,7 @@ async function run(request,env,owner) {
       if(!count) throw new Error('The provider returned no visible text.');
       if(structured){
         if(finishReason)throw new Error('The provider stopped before completing the JSON response.');
-        parseJsonObject(structuredText);
+        parseJsonObject(structuredText,schema);
         yield structuredText;
       }
       if(usage||upstreamModel)yield {usage,upstreamModel};
@@ -263,7 +265,14 @@ async function decision(env,owner,state,chat,scope,prompt,request=new Request('h
   }
   return decideWithJev({env,owner,state,chat,scope,prompt,request,key});
 }
-const tick=env=>tickJobs(env,executeJobModel,(env,id,...args)=>decision(env,{id},...args));
+async function searchWeb(env,owner,prompt,signal=new AbortController().signal){
+  const key=await vaultModelKey(env,owner,'search-tavily','tavily').catch(error=>{
+    if(error.status===400)throw new Problem(400,'Configure an authorized key for this tool.');
+    throw error;
+  });
+  return mediaRequest({operation:'search',prompt,key,signal,fetcher:env.MEDIA_FETCH??fetch});
+}
+const tick=env=>tickJobs(env,executeJobModel,(env,id,...args)=>decision(env,{id},...args),searchWeb);
 
 async function integrationModels(env,owner){
   const state=await loadWorkspace(env,owner);
@@ -289,15 +298,26 @@ async function integrationChat(request,env,owner){
   const supported=['model','messages','stream','stream_options','max_completion_tokens','max_tokens','temperature','response_format'];
   if(!input||Array.isArray(input)||Object.keys(input).some(key=>!supported.includes(key)))throw new Problem(400,'Unsupported chat completion field.');
   const format=input.response_format;
-  if(format!==undefined&&(!format||typeof format!=='object'||Array.isArray(format)||Object.keys(format).length!==1||
-    !['text','json_object'].includes(format.type)))throw new Problem(400,'Use a text or json_object response format.');
+  let schema;
+  if(format!==undefined){
+    if(!format||typeof format!=='object'||Array.isArray(format)||!['text','json_object','json_schema'].includes(format.type)||
+      Object.keys(format).some(key=>!['type',...(format.type==='json_schema'?['json_schema']:[])].includes(key)))
+      throw new Problem(400,'Use text, json_object, or json_schema response format.');
+    if(format.type==='json_schema'){
+      const descriptor=format.json_schema;
+      if(!descriptor||typeof descriptor!=='object'||typeof descriptor.name!=='string'||!/^[-a-zA-Z0-9_]{1,64}$/.test(descriptor.name)||
+        !descriptor.schema||Object.keys(descriptor).some(key=>!['name','schema','strict','description'].includes(key)))
+        throw new Problem(400,'Provide a JSON schema name and schema.');
+      schema=responseSchema(descriptor.schema);
+    }
+  }
   const context=integrationMessages(input.messages);
   const target=(await integrationModels(env,owner)).find(connection=>connection.id===input.model);
   if(!target)throw new Problem(404,'Select a vault model ID from the Kapron model list.');
   const maxOutput=input.max_completion_tokens??input.max_tokens;
   if(maxOutput!==undefined&&(!Number.isInteger(maxOutput)||maxOutput<16||maxOutput>32768))throw new Problem(400,'Use an output token limit from 16 to 32,768.');
   const requestUsage=input.stream_options?.include_usage===true;
-  const payload={...context,connectionId:target.id,model:target.model,options:{maxOutput,responseFormat:format?.type,temperature:input.temperature,reportUsage:target.capability?.reportUsage===true}};
+  const payload={...context,connectionId:target.id,model:target.model,options:{maxOutput,responseFormat:schema?'json_object':format?.type,responseSchema:schema,temperature:input.temperature,reportUsage:target.capability?.reportUsage===true}};
   const response=await run(new Request(request.url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload),signal:request.signal}),env,{id:owner});
   const id='chatcmpl-'+crypto.randomUUID();
   const created=Math.floor(Date.now()/1000);
@@ -358,13 +378,14 @@ async function integration(request,env,path){
   if(path==='/api/v1/runs'&&request.method==='POST'){
     const input=await readJson(request,60000);
     if(!input||typeof input!=='object')throw new Problem(400,'Enter a run definition.');
+    const runId=await runIdFor(owner,request.headers.get('idempotency-key'));
     if(input.workflowId){
       const state=await loadWorkspace(env,owner);
       const workflow=(state.workflows??[]).find(w=>w.id===input.workflowId);
       if(!workflow)throw new Problem(404,'Workflow unavailable.');
-      return json(await enqueueJob(env,owner,{...workflow,input:input.input}),202);
+      return json(await enqueueJob(env,owner,{...workflow,input:input.input},runId),202);
     }
-    return json(await enqueueJob(env,owner,input),202);
+    return json(await enqueueJob(env,owner,input,runId),202);
   }
   return json({error:'Route not found.'},404);
 }
@@ -380,18 +401,31 @@ async function api(request,env,path) {
   }
   const share=path.match(/^\/api\/public-share\/([a-zA-Z0-9-]{36})$/);
   if(share&&request.method==='GET')return json(await sharedSnapshot(env,share[1]));
-  if(path==='/api/auth-config'&&request.method==='GET')return json({mode:env.KAPRON_SUPABASE_URL?'email':'sites'});
-  const auth=path.match(/^\/api\/auth\/(login|signup|logout)$/);
-  if(auth&&request.method==='POST'&&env.KAPRON_SUPABASE_URL){
+  if(path==='/api/auth-config'&&request.method==='GET')return json(authConfig(env));
+  if(path.startsWith('/api/auth/')){
+    if(authConfig(env).mode!=='email')throw new Problem(404,'This authentication method is unavailable.');
+    const callback=path.match(/^\/api\/auth\/callback\/(google|email)$/);
+    if(callback&&request.method==='GET'){
+      const result=await completeAuth(request,env,callback[1]);
+      const headers=new Headers({...noCache,location:result.url});
+      for(const value of result.cookies)headers.append('set-cookie',value);
+      return new Response(null,{status:303,headers});
+    }
+    const auth=path.match(/^\/api\/auth\/(login|signup|logout|refresh|google)$/);
+    if(!auth||request.method!=='POST')throw new Problem(404,'Authentication route unavailable.');
     checkMutation(request);
-    const result=await authenticate(env,auth[1],auth[1]==='logout'?null:await readJson(request,10000));
-    return Response.json(result.data,{headers:{...noCache,...(result.cookie?{'set-cookie':result.cookie}:{})}});
+    const action=auth[1];
+    const values=['login','signup'].includes(action)?await readJson(request,10000):null;
+    const result=action==='google'?await startGoogle(request,env):await authenticate(request,env,action,values);
+    const headers=new Headers(noCache);
+    for(const value of result.cookies??[])headers.append('set-cookie',value);
+    return Response.json(result.data,{status:result.status??200,headers});
   }
   const owner=await ownerOf(request,env);
-  if(!env.DB) throw new Problem(503,'Workspace storage is unavailable.');
+  if(!env.DB)throw Object.assign(new Problem(503,'Workspace storage is unavailable. Configure the DB binding on the Kapron server.'),{publicAuth:true});
   const method=request.method;
   if(method!=='GET') checkMutation(request);
-  if(path==='/api/session' && method==='GET') return json({user:owner,vaultAvailable:!!env.KAPRON_VAULT_KEY,gatewayProvider:gatewayConfig(env)?.provider??null,authMode:env.KAPRON_SUPABASE_URL?'email':'sites'});
+  if(path==='/api/session' && method==='GET') return json({user:owner,vaultAvailable:!!env.KAPRON_VAULT_KEY,gatewayProvider:gatewayConfig(env)?.provider??null,authMode:authConfig(env).mode});
   if(path==='/api/gateway-models'&&method==='POST')return listGatewayModels(request,env,owner);
   if(path==='/api/model-quota'&&method==='GET'){
     const limit=dailyModelLimit(env), day=utcDay();
@@ -458,9 +492,9 @@ async function api(request,env,path) {
   if(path==='/api/tools'&&method==='POST'){
     const input=await readJson(request,1500000);
     if(!input||!['search','generate','edit','vision'].includes(input.operation))throw new Problem(400,'Invalid tool request.');
-    const search=input.operation==='search';
+    if(input.operation==='search')return json(await searchWeb(env,owner.id,input.prompt,request.signal));
     const workspace=await loadWorkspace(env,owner.id);
-    const connection=search?{id:'search-tavily',provider:'tavily',mode:'vault'}:workspace.connections.find(c=>c.id===input.connectionId&&c.provider==='openai');
+    const connection=workspace.connections.find(c=>c.id===input.connectionId&&c.provider==='openai');
     if(!connection)throw new Problem(400,'Select an OpenAI connection for image tools.');
     let key;
     if(connection.mode==='vault'&&env.KAPRON_VAULT_KEY){
@@ -500,7 +534,7 @@ async function api(request,env,path) {
   if(path==='/api/jobs'&&method==='POST'){
     const input=await readJson(request,70000);
     if(!input||typeof input!=='object')throw new Problem(400,'Enter a run definition.');
-    return json(await enqueueJob(env,owner.id,input),202);
+    return json(await enqueueJob(env,owner.id,input,await runIdFor(owner.id,request.headers.get('idempotency-key'))),202);
   }
   const replay=path.match(/^\/api\/jobs\/([a-zA-Z0-9-]{1,180})\/replay$/);
   if(replay&&method==='POST')return json(await replayJob(env,owner.id,replay[1]),202);
@@ -544,7 +578,7 @@ export default {
     const url=new URL(request.url);
     if(url.pathname.startsWith('/api/')){
       try{return await api(request,env,url.pathname);}
-      catch(error){const status=error.status>=400&&error.status<600?error.status:500;return json({error:status<500?error.message:'Kapron could not complete this request.'},status);}
+      catch(error){const status=error.status>=400&&error.status<600?error.status:500;return Response.json({error:status<500||error.publicAuth===true?error.message:'Kapron could not complete this request.'},{status,headers:{...noCache,...(error.needsSession?{'x-kapron-session':'required'}:{})}});}
     }
     if(!['GET','HEAD'].includes(request.method)) return new Response('Method not allowed',{status:405});
     const asset=assets[url.pathname==='/'?'/index.html':url.pathname];

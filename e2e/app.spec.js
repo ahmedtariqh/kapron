@@ -589,3 +589,24 @@ test('model arena compares two explicit destinations without private workspace c
   await expect(page.getByRole('article',{name:'Assistant reply'})).toContainText('Second result');
   expect(sent.messages).toEqual([{role:'user',content:'Arena shared fixture'}]);
 });
+
+test('research plans save query receipts and a filtered, deduplicated evidence report',async({page})=>{
+  const saved=await page.request.put('/api/vault/search-tavily',{headers:{'x-kapron-request':'1'},data:{provider:'tavily',key:'mock-browser-search-key'}});
+  expect(saved.status()).toBe(200);
+  await page.goto('/');
+  await page.getByRole('button',{name:'Research',exact:true}).click();
+  await page.getByLabel('Research question').fill('Research queue fixture');
+  await page.getByLabel('Query 1',{exact:true}).fill('First fixture search');
+  await page.getByRole('button',{name:'Add query'}).click();
+  await page.getByLabel('Query 2',{exact:true}).fill('Second fixture search');
+  await page.getByText('Source rules',{exact:true}).click();
+  await page.getByLabel('Blocked domains').fill('blocked.library.example');
+  await page.getByRole('button',{name:'Run research plan'}).click();
+  await expect(page.getByRole('status').filter({hasText:'completed'})).toBeVisible({timeout:15000});
+  await page.getByText('Evidence report · Evidence report',{exact:true}).click();
+  const report=page.locator('details').filter({hasText:'Evidence report · Evidence report'});
+  await expect(report.getByRole('link',{name:'Included evidence'})).toHaveCount(1);
+  await expect(report.getByRole('link',{name:'Excluded evidence'})).toHaveCount(0);
+  await report.getByRole('button',{name:'Open in Canvas'}).click();
+  await expect(page.getByRole('dialog').getByLabel('Content')).toHaveValue(/## Evidence excerpts/);
+});

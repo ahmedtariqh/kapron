@@ -2,6 +2,7 @@ import {useEffect,useState} from 'react';
 import {ArrowDown,ArrowUp,FileText,GitBranch,Play,Plus,Trash2} from 'lucide-react';
 import {get} from './api.js';
 import {Modal} from './dialogs.jsx';
+import {schemaFromText} from '../server/structured.js';
 import {isGateway} from '../server/providers.js';
 
 const createStep=type=>({
@@ -32,6 +33,9 @@ function StepList({nodes,onChange,state,projectId,depth=0,parallel=false,noteboo
       {['prompt','gem'].includes(node.type)&&<label>Step output<select value={node.responseFormat??'text'} onChange={event=>patch(i,{responseFormat:event.target.value})}>
         <option value="text">Text</option><option value="json_object">JSON object</option>
       </select></label>}
+      {['prompt','gem'].includes(node.type)&&node.responseFormat==='json_object'&&<label>Step response schema (optional)<textarea rows={4} maxLength={8000}
+        value={node.schemaDraft??(node.responseSchema?JSON.stringify(node.responseSchema,null,2):'')}
+        onChange={event=>patch(i,{schemaDraft:event.target.value})}/></label>}
       {node.type==='notebooklm'&&<>
         <label>Notebook<select required value={node.notebookId??''} onChange={e=>patch(i,{notebookId:e.target.value})}>
           <option value="">Choose an approved notebook</option>
@@ -74,6 +78,16 @@ function StepList({nodes,onChange,state,projectId,depth=0,parallel=false,noteboo
   </div>;
 }
 
+function parsedWorkflowNodes(nodes){
+  return nodes.map(({schemaDraft,...node})=>{
+    const clean={...node};
+    if(schemaDraft!==undefined&&node.responseFormat==='json_object')clean.responseSchema=schemaFromText(schemaDraft);
+    if(node.nodes)clean.nodes=parsedWorkflowNodes(node.nodes);
+    if(node.otherwise)clean.otherwise=parsedWorkflowNodes(node.otherwise);
+    return clean;
+  });
+}
+
 export function WorkflowEditor({entity,state,onClose,onSave,task=false,notebook=null}){
   const gatewayDefault=state.connections.find(c=>c.id===state.settings.defaultChoice?.connectionId&&c.mode==='vault'&&isGateway(c.provider));
   const [values,setValues]=useState({name:'',description:'',kind:task?'task':'workflow',projectId:'',policy:'fixed',connectionId:gatewayDefault?.id??'auto',
@@ -100,7 +114,7 @@ export function WorkflowEditor({entity,state,onClose,onSave,task=false,notebook=
   return <Modal wide title={task?'Plan a Cowork task':entity?'Edit workflow':'New workflow'} onClose={onClose}>
     <form className="modal-form" onSubmit={async e=>{
       e.preventDefault();setError('');setBusy(true);
-      try{await onSave({...values,name:values.name.trim(),projectId:values.projectId||null,scheduleMinutes:Number(values.scheduleMinutes)||0});}
+      try{await onSave({...values,nodes:parsedWorkflowNodes(values.nodes),name:values.name.trim(),projectId:values.projectId||null,scheduleMinutes:Number(values.scheduleMinutes)||0});}
       catch(error){setError(error.message);setBusy(false);}
     }}>
       <label>{task?'Task name':'Workflow name'}<input required autoFocus maxLength={100} value={values.name} onChange={e=>patch('name',e.target.value)}/></label>
@@ -179,6 +193,9 @@ export function Jobs({onCreate,onArtifact,onSkill,initialRun=null}){
       </div>
       {run.outputs.map((output,i)=><details className="advanced run-output" key={i} open={!!output.error}><summary>{output.label||'Step'} · {output.model??output.decision??'Blocked'}</summary>{output.decision?<p>{output.decision==='approved'?'Approved':'Rejected'} · {new Date(output.decided).toLocaleString()}</p>:output.error?<p className="form-error">{output.error}</p>:<>
         {output.usage&&<p className="hint">{output.usage.total!=null?output.usage.total+' tokens reported':'Token count unavailable'}{output.usage.costUsd!=null?' · USD '+output.usage.costUsd:''}</p>}
+        {output.sources?.length>0&&<ol className="research-results">{output.sources.map(source=><li key={source.url}>
+          <a href={source.url} target="_blank" rel="noreferrer">{source.title}</a>{source.date&&<small> · {source.date}</small>}<p dir="auto">{source.excerpt}</p>
+        </li>)}</ol>}
         <pre>{output.text}</pre><button className="button secondary" onClick={()=>onArtifact(output.label||run.definition.name,output.text,run.id)}><FileText size={15}/>Open in Canvas</button>{run.status==='completed'&&onSkill&&<button className="button secondary" onClick={()=>onSkill(run,output)}>Draft a skill</button>}</>}</details>)}
     </section>}
   </>;

@@ -1,3 +1,4 @@
+import {structuredInstruction} from './structured.js';
 export const providers = {
   demo: { name: 'Kapron Demo', model: 'local-demo', caption: 'Offline sample · no key needed' },
   openai: { name: 'OpenAI', model: 'gpt-4.1-mini', caption: 'Native streaming chat API' },
@@ -25,7 +26,7 @@ export function providerRequest({ provider, model, endpoint, messages, instructi
   const headers = { 'content-type': 'application/json', accept: 'text/event-stream' };
   const config = {};
   const jsonObject=options.responseFormat==='json_object';
-  if(jsonObject)instruction=[instruction,'Return only one valid JSON object. Use JSON without Markdown fences.'].filter(Boolean).join('\n\n');
+  if(jsonObject)instruction=[instruction,structuredInstruction(options)].filter(Boolean).join('\n\n');
   if (Number.isFinite(options.temperature)) config.temperature = Math.min(2, Math.max(0, options.temperature));
   if (Number.isInteger(options.maxOutput)) config.maxOutput = Math.min(32768, Math.max(16, options.maxOutput));
   if (provider === 'gemini') {

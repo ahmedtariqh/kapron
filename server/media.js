@@ -63,7 +63,7 @@ export async function mediaRequest({operation,prompt,image,key,model,signal,fetc
     try{
       const url=new URL(item.url);
       if(!['http:','https:'].includes(url.protocol)||url.username||url.password)return [];
-      return [{url:url.href,title:String(item.title??url.hostname).slice(0,200),excerpt:String(item.content??'').slice(0,1800)}];
+      return [{url:url.href,title:String(item.title??url.hostname).slice(0,200),excerpt:String(item.content??'').slice(0,1800),...(typeof item.published_date==='string'&&/^\d{4}-\d{2}-\d{2}/.test(item.published_date)?{date:item.published_date.slice(0,10)}:{})}];
     }catch{return [];}
   }).slice(0,5)};
   const data=result.data?.[0]?.b64_json;

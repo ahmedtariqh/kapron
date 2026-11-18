@@ -11,6 +11,7 @@ import {ConnectionEditor,EntityEditor,GemPicker,Modal,RunReview,SelectModel} fro
 import {resolveRoute} from './routing.js';
 import {ResourceEditor,RoutingSettings} from './resources.jsx';
 import {expandWorkflow} from '../server/jobs.js';
+import {Research} from './research.jsx';
 import {Jobs,WorkflowEditor} from './workflows.jsx';
 import {ArtifactEditor,ShareControls,SharedView} from './artifacts.jsx';
 import {formatSources,searchSources,Studio} from './studio.jsx';
@@ -100,7 +101,7 @@ function Message({message,onInspect,onCopy,onArtifact,onBranch,onQuote,onMark,on
   </article>;
 }
 function Workspace(){
-  const [data,setData]=useState(null),[session,setSession]=useState(null),[loadError,setLoadError]=useState(''),[authMode,setAuthMode]=useState(null);
+  const [data,setData]=useState(null),[session,setSession]=useState(null),[loadError,setLoadError]=useState(''),[authMode,setAuthMode]=useState(null),[googleAuth,setGoogleAuth]=useState(false);
   const latest=useRef(null),queue=useRef(Promise.resolve()),abort=useRef(null);
   const [notebookId,setNotebookId]=useState(null),[projectOverviewId,setProjectOverviewId]=useState(null);
   const [integrations,setIntegrations]=useState({}),[view,setView]=useState('chat'),[chatId,setChatId]=useState(null),[projectId,setProjectId]=useState(null);
@@ -122,21 +123,24 @@ function Workspace(){
   const shownConnection=getConnection(state,temporaryChoice?.connectionId??settings[0]?.choice.connectionId);
   const visibleChatId=chat?.id??chatId;
   const files=temporary?[]:state.files.filter(f=>f.chatId===chatId||(project&&f.projectId===project.id&&!f.chatId));
-  const draftSlot=useRef('');
+  const draftSlot=useRef(''),pendingSubmission=useRef(null);
   const user=session?.user?.id;
   const update=(next)=>{latest.current=next;setData(next);};
   const show=(text)=>setToast(text);
   async function boot(){
     setLoadError('');
     try{
-      const [who,workspace]=await Promise.all([get('session'),get('workspace')]);
+      const who=await get('session');
+      const workspace=await get('workspace');
       setSession(who);update(workspace);
       const previous=localRead('kapron:last:'+who.user.id);
       if(workspace.state.chats.some(x=>x.id===previous))setChatId(previous);
     }catch(e){
       if(e.status===401){
-        const config=await get('auth-config').catch(()=>({mode:'sites'}));
-        setAuthMode(config.mode);setLoadError('signin');
+        try{
+          const config=await get('auth-config');
+          setAuthMode(config.mode);setGoogleAuth(config.google===true);setLoadError('signin');
+        }catch(error){setLoadError(error.message);}
       }else setLoadError(e.message);
     }
   }
@@ -542,8 +546,13 @@ function Workspace(){
     close();show('Resource saved');
   }
   async function queueJob(values){
-    if(!values.name)throw new Error('Enter a name for this run.');
-    await get('jobs',{method:'POST',body:values});
+    if(values.kind!=='research'&&!values.name)throw new Error('Enter a name for this run.');
+    const definition=JSON.stringify(values);
+    if(pendingSubmission.current?.definition!==definition)pendingSubmission.current={definition,key:id()};
+    const submitted=pendingSubmission.current;
+    const result=await get('jobs',{method:'POST',body:values,idempotencyKey:submitted.key});
+    if(pendingSubmission.current===submitted)pendingSubmission.current=null;
+    setSelectedRun(result.id);
     setDialog(null);navigate('jobs');show('Run queued');
   }
   async function promoteArenaReply(prompt,result){
@@ -578,7 +587,7 @@ function Workspace(){
   const branchParent=chat?.branchParent&&state.chats.find(c=>c.id===chat.branchParent.chatId);
   const siblingBranches=chat?.branchParent?state.chats.filter(c=>c.id!==chat.id&&c.branchParent?.chatId===chat.branchParent.chatId&&c.branchParent?.messageId===chat.branchParent.messageId):[];
   const childBranches=chat?state.chats.filter(c=>c.branchParent?.chatId===chat.id):[];
-  if(!data)return <div className="gate"><Brand/>{loadError?<><h1>{loadError==='signin'?'Open your workspace':'Could not open Kapron'}</h1><p>{loadError==='signin'?'Sign in to open your private workspace.':loadError}</p>{loadError==='signin'?(authMode==='email'?<EmailAuth onSignedIn={boot}/>:<a className="button primary" href="/signin-with-chatgpt?returnTo=%2F" target="_top">Sign in<ArrowRight size={16}/></a>):<button className="button primary" onClick={boot}>Try again</button>}</>:<p>Opening your workspace…</p>}</div>;
+  if(!data)return <div className="gate"><Brand/>{loadError?<><h1>{loadError==='signin'?'Open your workspace':'Could not open Kapron'}</h1><p>{loadError==='signin'?'Sign in to open your private workspace.':loadError}</p>{loadError==='signin'?(authMode==='email'?<EmailAuth google={googleAuth} onSignedIn={boot}/>:<a className="button primary" href="/signin-with-chatgpt?returnTo=%2F" target="_top">Sign in<ArrowRight size={16}/></a>):<button className="button primary" onClick={boot}>Try again</button>}</>:<p>Opening your workspace…</p>}</div>;
   return <div className="app">
     {nav&&<button className="nav-scrim" aria-label="Close navigation" onClick={()=>setNav(false)}/>}
     <aside className={'sidebar'+(nav?' open':'')}>
@@ -587,7 +596,7 @@ function Workspace(){
       <button className="nav-item" disabled={running} onClick={startTemporary}><MessageSquare size={16}/>Temporary chat</button>
       <button className="nav-item" onClick={()=>setDialog({type:'history'})}><BookOpen size={16}/>Chat history</button>
       <div className="sidebar-nav"><p className="eyebrow">WORKSPACE</p>
-        {[['home','Home',Folder],['projects','Projects',Folder],['notebooks','Notebooks',BookOpen],['goals','Goals',Bookmark],['library','Library',BookOpen],['shared','Shared projects',Folder],['gems','Gems',Gem],['memory','Memory',Brain],['skills','Skills',Zap],['knowledge','Knowledge',BookOpen],['workflows','Workflows',GitBranch],['jobs','Cowork',Zap],['artifacts','Canvas',Pencil],['studio','Studio',Image],['integrations','Integrations',BookOpen],['connections','Connections',KeyRound],['arena','Model arena',GitBranch]].map(([v,label,Icon])=><button key={v} className={'nav-item'+(view===v?' selected':'')} onClick={()=>navigate(v)}><Icon size={17}/>{label}</button>)}
+        {[['home','Home',Folder],['projects','Projects',Folder],['notebooks','Notebooks',BookOpen],['goals','Goals',Bookmark],['library','Library',BookOpen],['shared','Shared projects',Folder],['gems','Gems',Gem],['memory','Memory',Brain],['skills','Skills',Zap],['knowledge','Knowledge',BookOpen],['workflows','Workflows',GitBranch],['jobs','Cowork',Zap],['research','Research',Search],['artifacts','Canvas',Pencil],['studio','Studio',Image],['integrations','Integrations',BookOpen],['connections','Connections',KeyRound],['arena','Model arena',GitBranch]].map(([v,label,Icon])=><button key={v} className={'nav-item'+(view===v?' selected':'')} onClick={()=>navigate(v)}><Icon size={17}/>{label}</button>)}
       </div>
       <div className="recent">
         <div className="recent-label"><p className="eyebrow">{projectId?project?.name||'PROJECT CHATS':'RECENT CHATS'}</p>{projectId&&<IconButton Icon={X} label="Show all chats" onClick={()=>{setProjectId(null);setChatId(null);}}/>}</div>
@@ -684,6 +693,7 @@ function Workspace(){
             detail={w=>'v'+w.version+(w.scheduleMinutes?' · Every '+w.scheduleMinutes+' min':' · Manual or API')} action="Run workflow" onOpen={w=>setDialog({type:'workflow-run',entity:w})}
             onExtra={entity=>setDialog({type:'revisions',kind:'workflow',entity})} extraLabel="Workflow versions" /></>}
         {view==='shared'&&<Collaboration/>}
+        {view==='research'&&<Research state={state} onQueue={queueJob} onSearchSettings={()=>navigate('studio')}/>}
         {view==='studio'&&<Studio state={state} user={user} vaultAvailable={session.vaultAvailable} onArtifact={(name,text)=>setDialog({type:'artifact',entity:{name,text}})}/>}
         {view==='integrations'&&<Integrations configured={integrations.notebooklm?.configured} onTask={notebook=>setDialog({type:'task',notebook})}/>}
         {view==='jobs'&&<Jobs onSkill={(run,output)=>setDialog({type:'resource',kind:'skill',seed:{name:run.definition.name.slice(0,80),description:'Draft from a completed run',projectId:run.definition.projectId,family:'general',text:('Describe how to reproduce this reviewed result. Replace this example with safe, reusable instructions.\n\nExample output:\n'+output.text).slice(0,40000),enabled:false}})} key={selectedRun??'job-list'} initialRun={selectedRun} onCreate={()=>setDialog({type:'task'})} onArtifact={(name,text,runId)=>setDialog({type:'artifact',entity:{name,text,origin:{kind:'run',id:runId}}})}/>}
@@ -936,8 +946,22 @@ function ProjectFileDialog({onClose,onSave}){
   }}><label>File<input type="file" required accept=".txt,.md,.csv,.json,.log" onChange={e=>setFile(e.target.files[0])}/></label>
   {error&&<p className="form-error" role="alert">{error}</p>}<button className="button primary" disabled={busy}>Add file</button></form></Modal>;
 }
-function EmailAuth({onSignedIn}){
-  const [signup,setSignup]=useState(false),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[busy,setBusy]=useState(false),[note,setNote]=useState('');
+function EmailAuth({google,onSignedIn}){
+  const [signup,setSignup]=useState(false),[email,setEmail]=useState(''),[password,setPassword]=useState(''),[busy,setBusy]=useState(false),[note,setNote]=useState(()=>{
+    const status=new URLSearchParams(location.search).get('auth');
+    if(status==='google-failed')return 'Google sign-in did not finish. Try again or sign in with email.';
+    if(status==='email-finish')return 'Sign in with your email and password after confirming your email.';
+    return '';
+  });
+  useEffect(()=>{
+    const url=new URL(location.href);
+    if(url.searchParams.has('auth')){url.searchParams.delete('auth');history.replaceState(null,'',url);}
+  },[]);
+  async function signInWithGoogle(){
+    setBusy(true);setNote('');
+    try{const result=await get('auth/google',{method:'POST'});location.assign(result.url);}
+    catch(error){setNote(error.message);setBusy(false);}
+  }
   return <form className="modal-form auth-form" onSubmit={async e=>{
     e.preventDefault();setNote('');setBusy(true);
     try{
@@ -946,9 +970,10 @@ function EmailAuth({onSignedIn}){
       if(result.confirmEmail){setNote('Confirm your email, then sign in.');setSignup(false);}else await onSignedIn();
     }catch(error){setNote(error.message);}finally{setBusy(false);}
   }}><label>Email<input type="email" required maxLength={254} autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)}/></label>
-  <label>Password<input type="password" required minLength={8} maxLength={128} autoComplete={signup?'new-password':'current-password'} value={password} onChange={e=>setPassword(e.target.value)}/></label>
+  <label>Password<input type="password" required minLength={signup?8:1} maxLength={128} autoComplete={signup?'new-password':'current-password'} value={password} onChange={e=>setPassword(e.target.value)}/></label>
   {note&&<p role="status">{note}</p>}<button className="button primary" disabled={busy}>{signup?'Create account':'Sign in'}</button>
-  <button type="button" className="button secondary" onClick={()=>{setSignup(!signup);setNote('');}}>{signup?'Use an existing account':'Create an account'}</button></form>;
+  {google&&<button type="button" className="button secondary" disabled={busy} onClick={signInWithGoogle}>Continue with Google</button>}
+  <button type="button" className="button secondary" disabled={busy} onClick={()=>{setSignup(!signup);setNote('');}}>{signup?'Use an existing account':'Create an account'}</button></form>;
 }
 const shared=new URLSearchParams(location.search).get('share');
 createRoot(document.getElementById('root')).render(shared?<SharedView id={shared}/>:<Workspace/>);

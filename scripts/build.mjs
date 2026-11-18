@@ -1,6 +1,9 @@
 import {build} from 'esbuild';
-import {mkdir,readFile,copyFile} from 'node:fs/promises';
+import {mkdir,readFile,copyFile,rm,writeFile} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
+const sitesBuild=process.argv.includes('--sites');
+const pagesBuild=process.argv.includes('--pages');
+if(sitesBuild&&pagesBuild)throw new Error('Choose either --sites or --pages.');
 const profile=process.env.KAPRON_BUILD_PROFILE||'standard';
 if(!['core','standard'].includes(profile))throw new Error('KAPRON_BUILD_PROFILE must be core or standard.');
 const moduleNames=['docx','xlsx','pptx','pdf','javascript','html'];
@@ -33,10 +36,17 @@ const digest=createHash('sha256').update(JSON.stringify(assets)).digest('hex').s
 add('sw.js',(await readFile('public/sw.js','utf8')).replaceAll('BUILD_REVISION',digest).replace('BUILD_CHUNKS',JSON.stringify(Object.keys(assets).filter(path=>path.startsWith('/chunks/')&&assets[path].body.length<200000))));
 await mkdir('dist/server',{recursive:true});
 await mkdir('dist/.openai',{recursive:true});
-const sitesBuild=process.argv.includes('--sites');
 if(sitesBuild)await copyFile('.openai/hosting.json','dist/.openai/hosting.json');
 await build({entryPoints:['server/worker.js'],outfile:'dist/server/index.js',bundle:true,format:'esm',platform:'neutral',define:{KAPRON_SITES_BUILD:JSON.stringify(sitesBuild)},target:'es2022',plugins:[{
  name:'kapron-assets',setup(b){b.onResolve({filter:/generated-assets\.js$/},()=>({path:'assets',namespace:'kapron'}));b.onLoad({filter:/.*/,namespace:'kapron'},()=>({contents:'export const assets='+JSON.stringify(assets),loader:'js'}));}
 }]});
 console.log('Built Kapron '+digest+' ('+profile+', '+([...enabledModules].join(', ')||'core only')+', '+
  Object.values(assets).reduce((bytes,asset)=>bytes+Buffer.byteLength(asset.body),0)+' asset bytes)');
+
+if(pagesBuild){
+ await rm('dist/pages',{recursive:true,force:true});
+ await mkdir('dist/pages',{recursive:true});
+ await copyFile('dist/server/index.js','dist/pages/_worker.js');
+ await copyFile('public/index.html','dist/pages/index.html');
+ await writeFile('dist/pages/_routes.json',JSON.stringify({version:1,include:['/*'],exclude:[]}));
+}

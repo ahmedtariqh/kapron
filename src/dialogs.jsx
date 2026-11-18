@@ -3,6 +3,7 @@ import {ArrowRight,Check,Gem,GitBranch,KeyRound,Layers3,MessageSquare,Settings2,
 import {autoConnection,taskFamilies} from '../server/routing.js';
 import {providers,isGateway,customBase,providerRequest,sse,extractText} from '../server/providers.js';
 import {gatewayModels} from '../server/gateway.js';
+import {schemaFromText} from '../server/structured.js';
 import {estimateRun} from '../server/model-policy.js';
 import {normalizeLabels} from './chat-library.js';
 import {get,getDeviceKey} from './api.js';
@@ -50,6 +51,7 @@ export function EntityEditor({type,entity,seed,defaultParent,state,onSave,onClos
   const [maxRunUsd,setMaxRunUsd]=useState(values?.options?.maxRunUsd??'');
   const [reasoningEffort,setReasoningEffort]=useState(values?.options?.reasoningEffort??'');
   const [responseFormat,setResponseFormat]=useState(values?.options?.responseFormat??'');
+  const [schema,setSchema]=useState(values?.options?.responseSchema?JSON.stringify(values.options.responseSchema,null,2):'');
   const [busy,setBusy]=useState(false),[error,setError]=useState('');
   const chat=type==='chat', project=type==='project',gem=type==='gem';
   const label=project?'project':gem?'Gem':'chat';
@@ -57,7 +59,7 @@ export function EntityEditor({type,entity,seed,defaultParent,state,onSave,onClos
     e.preventDefault();if(!name.trim())return;setBusy(true);setError('');
     try{
       const options={...(temperature!==''?{temperature:Number(temperature)}:{}),...(maxOutput!==''?{maxOutput:Number(maxOutput)}:{}),
-        ...(maxRunUsd!==''?{maxRunUsd:Number(maxRunUsd)}:{}),...(reasoningEffort?{reasoningEffort}:{}),...(responseFormat?{responseFormat}:{})};
+        ...(maxRunUsd!==''?{maxRunUsd:Number(maxRunUsd)}:{}),...(reasoningEffort?{reasoningEffort}:{}),...(responseFormat?{responseFormat,responseSchema:responseFormat==='json_object'?schemaFromText(schema):null}:{})};
       await onSave(chat?{title:name.trim(),projectId:projectId||null,choice,options,folder:folder.trim(),labels:normalizeLabels(labels.split(',')),
         historyChars:historyChars===''?undefined:Number(historyChars),compactHistory,pinnedFacts:pinnedFacts.trim()}:project?{name:name.trim(),description,instructions,parentId:parentId||null,choice,memoryMode,memoryEnabled:memoryMode==='personal',options}:{name:name.trim(),description,instructions,knowledge,choice,options});
     }catch(e){setError(e.message);setBusy(false);}
@@ -82,6 +84,7 @@ export function EntityEditor({type,entity,seed,defaultParent,state,onSave,onClos
         <label>Maximum estimated USD per call<input type="number" min="0" max="1000" step="0.000001" placeholder="Inherit" value={maxRunUsd} onChange={e=>setMaxRunUsd(e.target.value)}/></label>
         <label>Reasoning effort<select value={reasoningEffort} onChange={e=>setReasoningEffort(e.target.value)}><option value="">Inherit</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select><small>Requires a model that accepts reasoning effort.</small></label>
         <label>Response format<select value={responseFormat} onChange={event=>setResponseFormat(event.target.value)}><option value="">Inherit</option><option value="text">Text</option><option value="json_object">JSON object</option></select><small>Use a model that supports JSON responses.</small></label>
+        {responseFormat==='json_object'&&<label>Response schema (optional)<textarea rows={5} maxLength={8000} value={schema} onChange={event=>setSchema(event.target.value)}/></label>}
       </div></details>
       {project&&<label>Parent project<select value={parentId} onChange={event=>setParentId(event.target.value)}><option value="">Top level</option>{state.projects.filter(project=>project.id!==entity?.id).map(project=><option key={project.id} value={project.id}>{project.name}</option>)}</select></label>}
       {project&&<label>Project memory<select value={memoryMode} onChange={e=>setMemoryMode(e.target.value)}><option value="personal">Personal memory (account setting)</option><option value="project">Project-only memory</option><option value="disabled">Disabled</option></select></label>}

@@ -1,3 +1,4 @@
+import {structuredInstruction} from './structured.js';
 const encoder = new TextEncoder();
 const count = value => Number.isSafeInteger(value) && value >= 0 && value <= 100_000_000 ? value : undefined;
 const price = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100_000 ? value : undefined;
@@ -38,7 +39,8 @@ export function estimateRun(connection, model, context, options = {}, workspaceO
   const limits = [requested ?? (cap === undefined ? undefined : 2048), count(workspaceOptions.maxOutput), count(connection.model === model ? connection.capability?.maxOutput : undefined)]
     .filter(limit => limit !== undefined && limit >= 16);
   const maxOutput = limits.length ? Math.min(...limits) : undefined;
-  const inputBytes = encoder.encode(context.instruction || '').length + context.messages.reduce((total,message)=>total + encoder.encode(message.text).length + 16, 16);
+  const promptAddition=structuredInstruction(options);
+  const inputBytes = encoder.encode(context.instruction || '').length + (promptAddition?2+encoder.encode(promptAddition).length:0) + context.messages.reduce((total,message)=>total + encoder.encode(message.text).length + 16, 16);
   const pricing = modelPricing(connection,model);
   const estimatedUsd = pricing && maxOutput !== undefined ? (inputBytes * pricing.input + maxOutput * pricing.output) / 1_000_000 : undefined;
   const error = connection.provider !== 'demo' && cap !== undefined && (estimatedUsd === undefined || estimatedUsd > cap)

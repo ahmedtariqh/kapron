@@ -226,7 +226,7 @@ test('snapshot exports obey the chosen expiry and download policy',async()=>{
 
 test('hosted worker ignores forged Sites identity when independently configured',async()=>{
   const verified='8a103fae-f607-48bd-bbf4-4690d505a321';
-  const {db,request}=fixture({KAPRON_SUPABASE_URL:'https://fixture.supabase.co',KAPRON_SUPABASE_KEY:'fixture',AUTH_FETCH:async req=>{
+  const {db,request}=fixture({KAPRON_SUPABASE_URL:'https://fixture.supabase.co',KAPRON_SUPABASE_KEY:'sb_publishable_fixture',AUTH_FETCH:async req=>{
     assert.equal(req.url,'https://fixture.supabase.co/auth/v1/user');
     return Response.json({id:verified,email:'user@example.test'});
   }});
@@ -509,5 +509,103 @@ test('queued workflows resolve the retained Gem revision and ignore later edits'
     for(let n=0;n<4;n++)await tick();
     assert.equal(instructions.length,2);
     assert(instructions.every(text=>text.includes('Original instructions')&&!text.includes('Changed instructions')));
+  }finally{db.close();}
+});
+
+test('research batches respect domain rules and retry only failed searches before compiling evidence',async()=>{
+  const calls=[];
+  let outage=true;
+  const {db,request,tick}=fixture({MEDIA_FETCH:async req=>{
+    assert.equal(req.url,'https://api.tavily.com/search');
+    assert.equal(req.headers.get('authorization'),'Bearer research-fixture');
+    const {query}=await req.json();
+    calls.push(query);
+    if(query==='second query'&&outage)return Response.json({},{status:503});
+    return Response.json({results:[
+      {url:'https://source.example/article?utm_campaign='+encodeURIComponent(query),title:'Preferred source',content:'Public evidence.',published_date:'2026-11-18T00:00:00Z'},
+      {url:'https://news.example/report',title:'Second source',content:'Another excerpt.'},
+      {url:'https://skip.source.example/private',title:'Blocked',content:'must stay out'},
+      {url:'https://source.example.evil.test/spoof',title:'Lookalike',content:'must stay out'}
+    ]});
+  }});
+  try{
+    const headers={method:'POST',body:{kind:'research',question:'Research fixture',queries:['first query','second query'],
+      domains:{allow:['source.example','news.example'],block:['skip.source.example'],prefer:['source.example']},
+      useMemory:true,cloudRouting:true,input:'Private conversation draft'}};
+    assert.equal((await request('jobs',{...headers,body:{...headers.body,domains:{allow:['https://source.example']}}})).status,400);
+    await request('vault/search-tavily',{method:'PUT',body:{provider:'tavily',key:'research-fixture'}});
+    const queued=await request('jobs',headers);
+    assert.equal(queued.status,202);
+    const {id}=await queued.json();
+    await tick();
+    const run=()=>request('jobs/'+id).then(reply=>reply.json());
+    assert.equal((await run()).status,'blocked');
+    assert.deepEqual(calls.sort(),['first query','second query']);
+    assert.equal((await request('jobs/'+id,{user:'other'})).status,404);
+    outage=false;
+    await request('jobs/'+id,{method:'PATCH',body:{action:'resume'}});
+    await tick();await tick();
+    const complete=await run();
+    assert.equal(complete.status,'completed');
+    assert.equal(complete.definition.input,'');
+    assert.equal(complete.definition.useMemory,false);
+    assert.equal(calls.filter(query=>query==='first query').length,1);
+    const report=complete.outputs.at(-1);
+    assert.deepEqual(report.queries,['first query','second query']);
+    assert.deepEqual(report.sources.map(source=>source.url),['https://source.example/article','https://news.example/report']);
+    assert.match(report.text,/2026-11-18/);
+    assert.doesNotMatch(report.text,/Blocked|Lookalike|utm_campaign|Private conversation draft/);
+  }finally{db.close();}
+});
+
+test('integration response schemas validate fields and reject unsupported schemas before spending',async()=>{
+  const calls=[];
+  let output='{"items":[{"name":"alpha","count":2}]}';
+  const {request,db}=fixture({MODEL_FETCH:async outgoing=>{
+    calls.push(await outgoing.json());
+    return packet(output);
+  }});
+  try{
+    const state=initial();
+    state.connections=[{id:'source',provider:'openai',model:'fixture',mode:'vault'}];
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    await request('vault/source',{method:'PUT',body:{provider:'openai',key:'fixture'}});
+    const key=(await (await request('access-keys',{method:'POST'})).json()).value;
+    const schema={type:'object',required:['items'],additionalProperties:false,properties:{items:{type:'array',minItems:1,items:{
+      type:'object',additionalProperties:false,required:['name','count'],properties:{name:{type:'string',minLength:1},count:{type:'integer',minimum:1}}
+    }}}};
+    const complete=(input=schema)=>request('v1/chat/completions',{user:null,headers:{authorization:'Bearer '+key},method:'POST',body:{
+      model:'source',messages:[{role:'user',content:'Generate the report'}],response_format:{type:'json_schema',json_schema:{name:'report',schema:input,strict:true}}
+    }});
+    assert.equal((await complete({...schema,allOf:[]})).status,400);
+    assert.equal(calls.length,0);
+    const valid=await complete();
+    assert.equal(valid.status,200);
+    assert.equal((await valid.json()).choices[0].message.content,output);
+    assert.match(calls[0].messages[0].content,/Match this JSON schema exactly/);
+    output='{"items":[{"name":"alpha","count":"2"}]}';
+    const mismatch=await complete();
+    assert.equal(mismatch.status,424);
+    assert.match(await mismatch.text(),/\/items\/0\/count/);
+  }finally{db.close();}
+});
+
+test('concurrent Cowork submissions deduplicate by owner and enforce the pending capacity atomically',async()=>{
+  const {request,db}=fixture();
+  const body={kind:'task',name:'Test dedupe',policy:'fixed',connectionId:'demo',nodes:[{type:'prompt',prompt:'Run one task'}]};
+  const post=(user,key,current=body)=>request('jobs',{user,method:'POST',headers:{'idempotency-key':key},body:current});
+  try{
+    const retries=await Promise.all(Array.from({length:8},()=>post('alice','same-request-key-01')));
+    assert(retries.every(response=>response.status===202));
+    const ids=await Promise.all(retries.map(response=>response.json().then(run=>run.id)));
+    assert.equal(new Set(ids).size,1);
+    assert.equal((await post('alice','same-request-key-01',{...body,name:'Different request'})).status,409);
+    const other=await (await post('bob','same-request-key-01')).json();
+    assert.notEqual(other.id,ids[0]);
+    assert.equal((await post('alice','short')).status,400);
+    const parallel=await Promise.all(Array.from({length:37},(_,i)=>post('alice','another-request-key-'+i)));
+    assert.equal(parallel.filter(response=>response.status===202).length,29);
+    assert.equal(parallel.filter(response=>response.status===429).length,8);
+    assert.equal((await post('alice','same-request-key-01')).status,202);
   }finally{db.close();}
 });

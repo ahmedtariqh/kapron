@@ -1,10 +1,27 @@
 import {providerRequest,sse,extractText,providerError} from '../server/providers.js';
-import {parseJsonObject} from '../server/structured.js';
+import {parseJsonObject,responseSchema} from '../server/structured.js';
 import {reportedUsage} from '../server/model-policy.js';
 
-export async function api(path,{method='GET',body,signal}={}) {
+let sessionRefresh;
+function refreshSession(){
+  if(!sessionRefresh){
+    sessionRefresh=fetch('/api/auth/refresh',{method:'POST',headers:{'x-kapron-request':'1'}})
+      .then(response=>response.ok).catch(()=>false).finally(()=>{sessionRefresh=undefined;});
+  }
+  return sessionRefresh;
+}
+
+export async function api(path,{method='GET',body,signal,idempotencyKey}={}) {
   let response;
-  try{response=await fetch('/api/'+path,{method,signal,headers:{'x-kapron-request':'1',...(body===undefined?{}:{'content-type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)});}
+  const request=()=>fetch('/api/'+path,{method,signal,headers:{'x-kapron-request':'1',...(idempotencyKey?{'idempotency-key':idempotencyKey}:{}),...(body===undefined?{}:{'content-type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)});
+  try{
+    response=await request();
+    // The worker rejects unauthenticated requests before entering protected handlers.
+    if(response.status===401&&response.headers.get('x-kapron-session')==='required'&&await refreshSession()){
+      await response.body?.cancel();
+      response=await request();
+    }
+  }
   catch(e){if(e.name==='AbortError')throw e;throw new Error('Kapron could not reach the server.');}
   if(!response.ok){
     const payload=await response.json().catch(()=>({}));
@@ -38,6 +55,7 @@ export const saveDeviceKey=(user,id,value)=>deviceOperation(user,id,'put',value)
 export const removeDeviceKey=(user,id)=>deviceOperation(user,id,'delete');
 
 export async function streamRun({connection,model,context,options,user,signal,onDelta,onMetadata}){
+  const schema=options?.responseFormat==='json_object'?responseSchema(options?.responseSchema):undefined;
   const input={connectionId:connection.id,model,...context,options};
   let response, direct=false, key;
   if(connection.mode==='device'){
@@ -73,7 +91,7 @@ export async function streamRun({connection,model,context,options,user,signal,on
   if(!text)throw new Error('The provider returned no visible text.');
   if(structured){
     if(finishReason&&!['stop','STOP'].includes(finishReason))throw new Error('The provider stopped before completing the JSON response.');
-    parseJsonObject(text);
+    parseJsonObject(text,schema);
     onDelta(text);
   }
   onMetadata?.({usage,upstreamModel});

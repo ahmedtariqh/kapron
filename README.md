@@ -106,20 +106,35 @@ If you already initialized the remote with a README or license, clone it first a
 
 ## Independent hosting
 
-The public source build uses Supabase email authentication and Cloudflare Worker/D1 storage. Configure email confirmations and production email delivery in Supabase. Copy `wrangler.example.jsonc` to `wrangler.jsonc` and set your own project URL and database ID. Install Wrangler or run the following with `npx`.
+The public build uses Supabase Auth for identity and Cloudflare D1 for workspace storage. Configure these values on the running server.
 
-```sh
-npm ci
-npm run build
-npx wrangler d1 migrations apply kapron --remote
-npx wrangler secret put KAPRON_SUPABASE_KEY
-npx wrangler secret put KAPRON_VAULT_KEY
-npx wrangler deploy
-```
+| Setting | Value |
+| --- | --- |
+| `KAPRON_SUPABASE_URL` | Supabase Project URL from **Connect**, such as `https://PROJECT_REF.supabase.co`. The alias `SUPABASE_URL` also works. |
+| `KAPRON_SUPABASE_KEY` | Supabase publishable key, or the legacy `anon` key. The aliases `SUPABASE_PUBLISHABLE_KEY` and `SUPABASE_ANON_KEY` also work. |
+| `KAPRON_PUBLIC_URL` | The public Kapron origin, such as `https://kapron.example.com`. Set this when using a canonical host. |
+| `KAPRON_AUTH_GOOGLE` | Set to `1` after enabling Google in Supabase to show **Continue with Google**. |
+| `KAPRON_VAULT_KEY` | Existing 32-byte base64 encryption key for provider credentials. Keep the same value across releases. |
+| `DB` | D1 database binding. Apply the SQL migrations in `drizzle/`. |
 
-Use your Supabase publishable key or legacy anon key. Set the vault key to a 32-byte base64 value, for example from `openssl rand -base64 32`, and back it up securely. Use the same vault key across releases. The example Cron Trigger advances durable runs once per minute in hosted mode. Local mode advances runs every three seconds. Workspaces and outputs have bounded storage and run sizes. Review quotas and provider costs before offering public signups.
+Get the project URL and API key separately from `SUPABASE_DATABASE_PASSWORD`. The database password is for a direct Postgres connection.
 
-[Supabase Auth](https://supabase.com/docs/guides/auth) · [Cloudflare Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+### Email and Google sign-in
+
+1. In **Supabase → Authentication → URL Configuration**, set **Site URL** to the public Kapron origin. Add the exact URLs `https://YOUR-KAPRON-HOST/api/auth/callback/email` and `https://YOUR-KAPRON-HOST/api/auth/callback/google` to **Redirect URLs**.
+2. Enable the Email provider and new-user signup. Keep the email confirmation template's confirmation link enabled. Set up custom SMTP for public confirmation emails. Confirmations opened in a separate browser may require signing in with the original email and password.
+3. In Google Cloud, create a Web application OAuth client. Add the **Supabase** callback URL shown in the Google provider settings, typically `https://PROJECT_REF.supabase.co/auth/v1/callback`, to **Authorized redirect URIs**. Enter the Google client ID and secret in the **Supabase** Google provider settings and enable the provider.
+4. Set `KAPRON_AUTH_GOOGLE=1` in the Kapron runtime. Redeploy, then check that `/api/auth-config` returns `{"mode":"email","ready":true,"google":true}`. Test both login methods with a fresh browser session.
+
+### Cloudflare Workers and Pages
+
+Use `dist/server/index.js` as the module entry point for a Worker. Bind D1 as `DB` and configure a Cron Trigger to drive background runs. Local mode advances runs every three seconds.
+
+For Pages, use build command `npm run build:pages` and output directory `dist/pages`. This build places the module at `_worker.js` so the same Pages origin serves `/api/`, including authentication callbacks. Configure D1 and the environment variables in the Pages Functions runtime for the environment you deploy. Background jobs on a Pages installation need a separate scheduled Worker using the same database and applicable secrets.
+
+To test real accounts in local development, set `KAPRON_LOCAL_REQUIRE_AUTH=1` and the same authentication settings, and allow the loopback callback URLs in Supabase. Regular local development remains single-user.
+
+[Supabase API keys](https://supabase.com/docs/guides/getting-started/api-keys) · [Google sign-in](https://supabase.com/docs/guides/auth/social-sign-in/auth-google) · [Supabase redirect URLs](https://supabase.com/docs/guides/auth/redirect-urls) · [Cloudflare Pages Advanced Mode](https://developers.cloudflare.com/pages/functions/advanced-mode/)
 
 ## Integration API
 
@@ -236,3 +251,13 @@ For Cowork and unattended workflows, use **Auto**, enable Jev classification, op
 - **Workflows** support prompt-based drafting, JSON field conditions with optional alternate branches, and explicit owner approvals. Cowork replay creates a fresh run with the stored input and expanded steps. It reads current project resources and requires fresh approvals.
 - Select **JSON object** under generation settings for a chat, project or Gem, or under step output in a workflow. Kapron validates the completed object before using it. Compatible integration clients can request `response_format: {"type":"json_object"}`.
 - **Model arena** compares two explicit model choices on the same prompt, offers an optional blind comparison, and saves the preferred reply in a chat. Results include response time and reported token counts after you reveal the models. Workspace context stays outside both requests.
+
+### Research plans
+
+Open **Research**, enter a question and review up to four search queries. Optional domain rules filter and rank results. The run uses the Tavily key configured in Studio and saves query-level evidence in Cowork. If a query fails, Resume retries that query while retaining completed queries. Open the compiled evidence report in Canvas to review or export it.
+
+### Structured output and Cowork submissions
+
+Choose **JSON object** under generation settings and enter an optional object schema in chat settings, a Gem, a project, or a workflow step. The integration API accepts a `json_schema` response format. Kapron sends the schema to the selected model and validates the completed output before release. Supported keywords cover required properties, additional-property control, nested arrays and objects, scalar enums, and size or numeric bounds. A mismatch identifies the failing field and leaves the run available for correction and retry.
+
+The integrations API accepts an optional `Idempotency-Key` header on `POST /api/v1/runs`. Reuse the key when retrying the same request. Duplicate submissions return the existing run, and reusing the key for a different definition returns HTTP 409.

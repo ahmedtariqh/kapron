@@ -22,7 +22,11 @@ if(!key){
   try{key=readFileSync(join(localDir,'vault.key'),'utf8');}
   catch(e){if(e.code!=='ENOENT')throw e;key=randomBytes(32).toString('base64');writeFileSync(join(localDir,'vault.key'),key,{mode:0o600,flag:'wx'});}
 }
-const env={LOCAL_USER:true,KAPRON_VAULT_KEY:key,
+const requireAuth=process.env.KAPRON_LOCAL_REQUIRE_AUTH==='1';
+const authSettings=Object.fromEntries(['KAPRON_SUPABASE_URL','SUPABASE_URL','KAPRON_SUPABASE_KEY','SUPABASE_PUBLISHABLE_KEY','SUPABASE_ANON_KEY','KAPRON_PUBLIC_URL','KAPRON_AUTH_GOOGLE']
+  .map(name=>[name,process.env[name]]));
+if(requireAuth)authSettings.KAPRON_SUPABASE_URL=authSettings.KAPRON_SUPABASE_URL||authSettings.SUPABASE_URL||'misconfigured';
+const env={LOCAL_USER:!requireAuth,...authSettings,KAPRON_VAULT_KEY:key,
   KAPRON_GATEWAY_PROVIDER:process.env.KAPRON_GATEWAY_PROVIDER,
   KAPRON_GATEWAY_URL:process.env.KAPRON_GATEWAY_URL,
   KAPRON_DAILY_MODEL_UNITS:process.env.KAPRON_DAILY_MODEL_UNITS,
@@ -46,7 +50,10 @@ createServer(async (req,res)=>{
     const request=new Request(new URL(req.url,protocol+'://'+publicHost),{method:req.method,headers:req.headers,signal:controller.signal,
       ...(!['GET','HEAD'].includes(req.method)?{body:Readable.toWeb(req),duplex:'half'}:{})});
     const response=await worker.fetch(request,env);
-    res.writeHead(response.status,Object.fromEntries(response.headers));
+    const headers=Object.fromEntries(response.headers);
+    const cookies=response.headers.getSetCookie();
+    if(cookies.length)headers['set-cookie']=cookies;
+    res.writeHead(response.status,headers);
     if(response.body) Readable.fromWeb(response.body).on('error',()=>res.destroy()).pipe(res);
     else res.end();
   } catch {if(!res.headersSent)res.writeHead(500);res.end('Local server error');}

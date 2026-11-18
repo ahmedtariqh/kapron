@@ -41,4 +41,14 @@ process.env.KAPRON_NOTEBOOKLM_URL='http://127.0.0.1:'+server.address().port;
 process.env.KAPRON_NOTEBOOKLM_TOKEN='test-notebooklm-token';
 process.env.KAPRON_GATEWAY_PROVIDER='litellm';
 process.env.KAPRON_GATEWAY_URL='http://127.0.0.1:'+server.address().port+'/v1';
+const upstreamFetch=globalThis.fetch;
+globalThis.fetch=async (request,init)=>{
+  if(request?.url!=='https://api.tavily.com/search')return upstreamFetch(request,init);
+  if(request.headers.get('authorization')!=='Bearer mock-browser-search-key')return Response.json({}, {status:401});
+  const {query}=await request.json();
+  return Response.json({results:[
+    {url:'https://library.example/evidence?utm_medium='+encodeURIComponent(query),title:'Included evidence',content:'Fixture evidence for both queries.',published_date:'2026-11-18'},
+    {url:'https://blocked.library.example/other',title:'Excluded evidence',content:'The domain filter should remove this.'}
+  ]});
+};
 await import('../scripts/local.mjs');

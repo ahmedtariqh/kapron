@@ -16,37 +16,40 @@ export function Modal({title,eyebrow,children,onClose,wide=false}){
     {children}
   </dialog>;
 }
-export function SelectModel({state,value,onChange,inherit=true}){
+export function SelectModel({state,value,onChange,inherit=true,allowAuto=true}){
   const id=value?.connectionId??'';
   const selected=getConnection(state,id);
   return <div className="select-model">
     <label>Connection<select value={id} onChange={e=>{
       const c=getConnection(state,e.target.value);
       onChange(c?{connectionId:c.id,model:c.model}:null);
-    }}>{inherit&&<option value="">Inherit model</option>}{[autoConnection,demoConnection,...state.connections].map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
+    }}>{inherit&&<option value="">Inherit model</option>}{[...(allowAuto?[autoConnection]:[]),demoConnection,...state.connections].map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
     {selected&&!['demo','auto'].includes(selected.provider)&&<label>Model ID<input required maxLength={160} value={value.model} onChange={e=>onChange({...value,model:e.target.value})} placeholder={selected.model}/></label>}
   </div>;
 }
 function FormActions({onClose,children='Save',busy=false}){
   return <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy?'Saving…':children}</button></div>;
 }
-export function EntityEditor({type,entity,state,onSave,onClose}){
-  const [name,setName]=useState(entity?.name||entity?.title||'');
-  const [description,setDescription]=useState(entity?.description||'');
-  const [instructions,setInstructions]=useState(entity?.instructions||'');
-  const [knowledge,setKnowledge]=useState(entity?.knowledge||'');
-  const [choice,setChoice]=useState(entity?.choice??null);
+export function EntityEditor({type,entity,seed,defaultParent,state,onSave,onClose}){
+  const values=entity??seed;
+  const [name,setName]=useState(values?.name||entity?.title||'');
+  const [description,setDescription]=useState(values?.description||'');
+  const [instructions,setInstructions]=useState(values?.instructions||'');
+  const [knowledge,setKnowledge]=useState(values?.knowledge||'');
+  const [choice,setChoice]=useState(values?.choice??null);
   const [memoryMode,setMemoryMode]=useState(entity?.memoryMode??(entity?.memoryEnabled===false?'disabled':'personal'));
+  const [parentId,setParentId]=useState(entity?.parentId??defaultParent??'');
   const [projectId,setProjectId]=useState(entity?.projectId??'');
   const [folder,setFolder]=useState(entity?.folder??'');
   const [labels,setLabels]=useState(entity?.labels?.join(', ')??'');
   const [historyChars,setHistoryChars]=useState(entity?.historyChars??'');
   const [compactHistory,setCompactHistory]=useState(entity?.compactHistory===true);
   const [pinnedFacts,setPinnedFacts]=useState(entity?.pinnedFacts??'');
-  const [temperature,setTemp]=useState(entity?.options?.temperature??'');
-  const [maxOutput,setMax]=useState(entity?.options?.maxOutput??'');
-  const [maxRunUsd,setMaxRunUsd]=useState(entity?.options?.maxRunUsd??'');
-  const [reasoningEffort,setReasoningEffort]=useState(entity?.options?.reasoningEffort??'');
+  const [temperature,setTemp]=useState(values?.options?.temperature??'');
+  const [maxOutput,setMax]=useState(values?.options?.maxOutput??'');
+  const [maxRunUsd,setMaxRunUsd]=useState(values?.options?.maxRunUsd??'');
+  const [reasoningEffort,setReasoningEffort]=useState(values?.options?.reasoningEffort??'');
+  const [responseFormat,setResponseFormat]=useState(values?.options?.responseFormat??'');
   const [busy,setBusy]=useState(false),[error,setError]=useState('');
   const chat=type==='chat', project=type==='project',gem=type==='gem';
   const label=project?'project':gem?'Gem':'chat';
@@ -54,9 +57,9 @@ export function EntityEditor({type,entity,state,onSave,onClose}){
     e.preventDefault();if(!name.trim())return;setBusy(true);setError('');
     try{
       const options={...(temperature!==''?{temperature:Number(temperature)}:{}),...(maxOutput!==''?{maxOutput:Number(maxOutput)}:{}),
-        ...(maxRunUsd!==''?{maxRunUsd:Number(maxRunUsd)}:{}),...(reasoningEffort?{reasoningEffort}:{})};
+        ...(maxRunUsd!==''?{maxRunUsd:Number(maxRunUsd)}:{}),...(reasoningEffort?{reasoningEffort}:{}),...(responseFormat?{responseFormat}:{})};
       await onSave(chat?{title:name.trim(),projectId:projectId||null,choice,options,folder:folder.trim(),labels:normalizeLabels(labels.split(',')),
-        historyChars:historyChars===''?undefined:Number(historyChars),compactHistory,pinnedFacts:pinnedFacts.trim()}:project?{name:name.trim(),description,instructions,choice,memoryMode,memoryEnabled:memoryMode==='personal',options}:{name:name.trim(),description,instructions,knowledge,choice,options});
+        historyChars:historyChars===''?undefined:Number(historyChars),compactHistory,pinnedFacts:pinnedFacts.trim()}:project?{name:name.trim(),description,instructions,parentId:parentId||null,choice,memoryMode,memoryEnabled:memoryMode==='personal',options}:{name:name.trim(),description,instructions,knowledge,choice,options});
     }catch(e){setError(e.message);setBusy(false);}
   };
   return <Modal title={(entity?'Edit ':'New ')+label} eyebrow={project?'WORKSPACE':gem?'REUSABLE ASSISTANT':'CONVERSATION'} onClose={onClose}>
@@ -78,7 +81,9 @@ export function EntityEditor({type,entity,state,onSave,onClose}){
         <label>Output token limit<input type="number" min="16" max="32768" step="1" placeholder="Inherit" value={maxOutput} onChange={e=>setMax(e.target.value)}/></label>
         <label>Maximum estimated USD per call<input type="number" min="0" max="1000" step="0.000001" placeholder="Inherit" value={maxRunUsd} onChange={e=>setMaxRunUsd(e.target.value)}/></label>
         <label>Reasoning effort<select value={reasoningEffort} onChange={e=>setReasoningEffort(e.target.value)}><option value="">Inherit</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select><small>Requires a model that accepts reasoning effort.</small></label>
+        <label>Response format<select value={responseFormat} onChange={event=>setResponseFormat(event.target.value)}><option value="">Inherit</option><option value="text">Text</option><option value="json_object">JSON object</option></select><small>Use a model that supports JSON responses.</small></label>
       </div></details>
+      {project&&<label>Parent project<select value={parentId} onChange={event=>setParentId(event.target.value)}><option value="">Top level</option>{state.projects.filter(project=>project.id!==entity?.id).map(project=><option key={project.id} value={project.id}>{project.name}</option>)}</select></label>}
       {project&&<label>Project memory<select value={memoryMode} onChange={e=>setMemoryMode(e.target.value)}><option value="personal">Personal memory (account setting)</option><option value="project">Project-only memory</option><option value="disabled">Disabled</option></select></label>}
       {error&&<p className="form-error" role="alert">{error}</p>}
       <FormActions onClose={onClose} busy={busy}>{entity?'Save changes':'Create '+label}</FormActions>

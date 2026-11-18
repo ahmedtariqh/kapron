@@ -398,3 +398,116 @@ test('Auto uses the Abliterated profile only after a confident, approved preflig
     assert.equal(chooseModel(state.connections.slice(1),'writing',100),undefined);
   }finally{db.close();}
 });
+
+test('JSON jobs select one branch, pause for owner approval and record one decision per gate',async()=>{
+  const inputs=[];
+  const {request,tick,db}=fixture({MODEL_FETCH:async outgoing=>{
+    const input=await outgoing.json();
+    inputs.push(input);
+    return input.response_format?.type==='json_object'?packet('{"result":{"accepted":true}}'):packet('confirmed');
+  }});
+  try{
+    const state=initial();
+    state.connections=[{id:'source',provider:'openai',model:'fixture',mode:'vault'}];
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    await request('vault/source',{method:'PUT',body:{provider:'openai',key:'fixture'}});
+    const queued=await request('jobs',{method:'POST',body:{name:'Report fixture',connectionId:'source',policy:'fixed',nodes:[
+      {type:'prompt',prompt:'Return the result as JSON',responseFormat:'json_object'},
+      {type:'condition',match:'json',path:'result.accepted',equals:true,nodes:[
+        {type:'approval',note:'Check the analysis'},
+        {type:'approval',note:'Check the proposed deliverable'},
+        {type:'prompt',prompt:'Only the accepted branch'}
+      ],otherwise:[{type:'prompt',prompt:'Only the rejected branch'}]}
+    ]}});
+    assert.equal(queued.status,202);
+    const {id}=await queued.json();
+    const status=async()=>await (await request('jobs/'+id)).json();
+    for(let n=0;n<3;n++)await tick();
+    let run=await status();
+    assert.equal(run.status,'awaiting_approval');
+    assert.equal(run.cursor,2);
+    assert.equal(inputs.length,1);
+    const approve=(user,step)=>request('jobs/'+id,{user,method:'PATCH',body:{action:'approve',step}});
+    assert.equal((await request('jobs/'+id,{user:'bob'})).status,404);
+    assert.equal((await approve('bob',2)).status,409);
+    const racing=await Promise.all([approve('alice',2),approve('alice',2)]);
+    assert.deepEqual(racing.map(reply=>reply.status).sort(),[200,409]);
+    await tick();
+    run=await status();
+    assert.equal(run.cursor,3);
+    assert.equal(run.status,'awaiting_approval');
+    assert.equal((await approve('alice',2)).status,409);
+    assert.equal((await approve('alice',3)).status,200);
+    for(let n=0;n<3;n++)await tick();
+    run=await status();
+    assert.equal(run.status,'completed');
+    assert.deepEqual(run.outputs.filter(output=>output.decision).map(output=>output.step),[2,3]);
+    assert.equal(inputs.length,2);
+    assert.equal(inputs[1].messages.at(-1).content.includes('Only the accepted branch'),true);
+    assert.deepEqual(inputs[0].response_format,{type:'json_object'});
+    assert.equal((await request('jobs/'+id+'/replay',{user:'bob',method:'POST'})).status,404);
+    const replay=await request('jobs/'+id+'/replay',{method:'POST'});
+    assert.equal(replay.status,202);
+    const newRun=await replay.json();
+    assert.notEqual(newRun.id,id);
+    assert.equal((await request('jobs/'+newRun.id+'/replay',{method:'POST'})).status,409);
+    for(let n=0;n<3;n++)await tick();
+    const pending=await (await request('jobs/'+newRun.id)).json();
+    assert.equal(pending.status,'awaiting_approval');
+    assert.equal(pending.definition.replayOf,id);
+    assert.equal(pending.outputs.some(output=>output.decision),false);
+  }finally{db.close();}
+});
+
+test('JSON mode validates complete objects and blocks malformed provider results',async()=>{
+  let reply='{"valid":true}';
+  const {request,db}=fixture({MODEL_FETCH:async outgoing=>{
+    const input=await outgoing.json();
+    assert.deepEqual(input.response_format,{type:'json_object'});
+    assert.match(input.messages[0].content,/JSON object/);
+    return packet(reply);
+  }});
+  try{
+    const state=initial();
+    state.connections=[{id:'source',provider:'openai',model:'fixture',mode:'vault'}];
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    await request('vault/source',{method:'PUT',body:{provider:'openai',key:'fixture'}});
+    const issued=await (await request('access-keys',{method:'POST'})).json();
+    const headers={authorization:'Bearer '+issued.value};
+    const execute=(response_format={type:'json_object'})=>request('v1/chat/completions',{method:'POST',headers,user:null,
+      body:{model:'source',messages:[{role:'user',content:'Analyze this'}],response_format}});
+    assert.equal((await execute({type:'json_schema'})).status,400);
+    const result=await (await execute()).json();
+    assert.deepEqual(JSON.parse(result.choices[0].message.content),{valid:true});
+    reply='["not","an","object"]';
+    const invalid=await execute();
+    assert.equal(invalid.status,424);
+    assert.match(await invalid.text(),/valid JSON object/);
+  }finally{db.close();}
+});
+
+test('queued workflows resolve the retained Gem revision and ignore later edits',async()=>{
+  const instructions=[];
+  const {request,tick,db}=fixture({MODEL_FETCH:async outgoing=>{
+    const input=await outgoing.json();
+    instructions.push(input.messages[0].content);
+    return packet('done');
+  }});
+  try{
+    const state=initial();
+    state.connections=[{id:'source',provider:'openai',model:'fixture',mode:'vault'}];
+    state.gems=[{id:'g',version:1,name:'Versioned Gem',instructions:'Original instructions'}];
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    await request('vault/source',{method:'PUT',body:{provider:'openai',key:'fixture'}});
+    const run={name:'Pinned Gem fixture',connectionId:'source',policy:'fixed',nodes:[{type:'gem',gemId:'g',prompt:'Use the Gem'}]};
+    assert.equal((await request('jobs',{method:'POST',body:run})).status,202);
+    const old=state.gems[0];
+    state.gems=[{...old,version:2,instructions:'Changed instructions',versions:[{version:1,config:old}]}];
+    await request('workspace',{method:'PUT',body:{state,revision:1}});
+    assert.equal((await request('jobs',{method:'POST',body:{...run,nodes:[{...run.nodes[0],gemVersion:5}]}})).status,400);
+    assert.equal((await request('jobs',{method:'POST',body:{...run,nodes:[{...run.nodes[0],gemVersion:1}]}})).status,202);
+    for(let n=0;n<4;n++)await tick();
+    assert.equal(instructions.length,2);
+    assert(instructions.every(text=>text.includes('Original instructions')&&!text.includes('Changed instructions')));
+  }finally{db.close();}
+});

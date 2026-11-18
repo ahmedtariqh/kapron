@@ -425,3 +425,167 @@ test('library organizes a reference and restores an earlier Canvas version',asyn
   await page.getByRole('button',{name:'Restore version 1 to editor'}).click();
   await expect(content).toHaveValue('First version');
 });
+
+test('creates a scoped notebook with durable evidence, source controls, and study cards',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'Notebooks',exact:true}).click();
+  await page.getByRole('button',{name:'New notebook'}).click();
+  await page.getByLabel('Notebook name').fill('Orbital research fixture');
+  await page.getByRole('button',{name:'Save notebook'}).click();
+  await page.getByRole('button',{name:'Sources',exact:true}).click();
+  await page.getByRole('button',{name:'Add source'}).click();
+  await page.getByLabel('Source name').fill('Field notes');
+  await page.getByLabel('Source text').fill('The Moon orbits Earth. Its visible phase changes over time.');
+  await page.getByLabel('Source notes').fill('Prepared for the unit on orbital periods.');
+  await page.getByRole('button',{name:'Save source'}).click();
+  await page.getByRole('button',{name:'Evidence',exact:true}).click();
+  await page.getByLabel('Question about your sources').fill('What does the Moon orbit?');
+  await page.getByRole('button',{name:'Find evidence'}).click();
+  await expect(page.getByRole('blockquote')).toHaveText('The Moon orbits Earth.');
+  await page.getByRole('button',{name:'Save study card'}).click();
+  await page.getByRole('button',{name:'Study',exact:true}).click();
+  await page.getByText('What does the Moon orbit?',{exact:true}).click();
+  await expect(page.getByText('The Moon orbits Earth.',{exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Review due cards'}).click();
+  await page.getByRole('button',{name:'Reveal answer'}).click();
+  await page.getByRole('button',{name:'Remembered',exact:true}).click();
+  await expect(page.getByRole('dialog').getByRole('status')).toHaveText('All due cards reviewed.');
+  await page.getByRole('button',{name:'Close dialog'}).click();
+  await page.getByRole('button',{name:'Sources',exact:true}).click();
+  await page.getByRole('checkbox',{name:'Use in evidence'}).click();
+  await expect(page.getByRole('checkbox',{name:'Use in evidence'})).not.toBeChecked();
+  await page.getByRole('button',{name:'Evidence',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Find evidence'})).toBeDisabled();
+  await page.reload();
+  await page.getByRole('button',{name:'Search workspace',exact:true}).click();
+  await page.getByRole('dialog').getByLabel('Search workspace').fill('orbital research fixture');
+  await page.getByRole('dialog').getByRole('button',{name:/Orbital research fixture/}).click();
+  await expect(page.getByRole('button',{name:'Find evidence'})).toBeDisabled();
+  await expect(page.getByRole('blockquote')).toHaveText('The Moon orbits Earth.');
+});
+
+test('workspace backup downloads and restores copies of linked project records',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'Projects',exact:true}).click();
+  await page.getByRole('button',{name:'New project',exact:true}).first().click();
+  await page.getByLabel('Project name').fill('Archive parent fixture');
+  await page.getByRole('button',{name:'Create project',exact:true}).click();
+  await page.getByRole('article').filter({hasText:'Archive parent fixture'}).getByRole('button',{name:'Project overview'}).click();
+  await page.getByRole('button',{name:'New subproject'}).click();
+  await expect(page.getByLabel('Parent project')).toHaveText(/Archive parent fixture/);
+  await page.getByLabel('Project name').fill('Archive child fixture');
+  await page.getByRole('button',{name:'Create project',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Archive child fixture'})).toBeVisible();
+  await page.getByRole('button',{name:/Local workspace/}).click();
+  await page.getByRole('button',{name:'Workspace backup',exact:true}).click();
+  const pending=page.waitForEvent('download');
+  await page.getByRole('button',{name:'Download workspace backup'}).click();
+  const download=await pending;
+  await page.getByLabel('Choose backup file').setInputFiles(await download.path());
+  await page.getByRole('button',{name:'Restore copies'}).click();
+  await expect(page.getByRole('status').filter({hasText:'Workspace backup restored'})).toBeVisible();
+  const {state}=await (await page.request.get('/api/workspace')).json();
+  const parents=state.projects.filter(item=>item.name==='Archive parent fixture');
+  const children=state.projects.filter(item=>item.name==='Archive child fixture');
+  expect(parents).toHaveLength(2);
+  expect(children.map(item=>item.parentId).sort()).toEqual(parents.map(item=>item.id).sort());
+  await page.getByRole('button',{name:'Home',exact:true}).click();
+  await expect(page.getByRole('heading',{name:'Needs attention'})).toBeVisible();
+});
+
+test('memory manager pins, merges, and exports same-scope entries',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'Memory',exact:true}).click();
+  for(const text of ['Memory Alpha merge fixture','Memory Beta merge fixture']){
+    await page.getByRole('button',{name:'Add memory',exact:true}).click();
+    await page.getByLabel('Reason').fill('Test provenance');
+    await page.getByLabel(/What should Kapron remember/).fill(text);
+    await page.getByRole('checkbox',{name:'Prioritize within the memory budget'}).check();
+    await page.getByRole('button',{name:'Save memory',exact:true}).click();
+    await expect(page.getByText(text,{exact:true})).toBeVisible();
+  }
+  for(const text of ['Memory Alpha merge fixture','Memory Beta merge fixture']){
+    await page.getByRole('article').filter({hasText:text}).getByRole('checkbox').check();
+  }
+  await page.getByRole('button',{name:'Merge selected'}).click();
+  await page.getByLabel('Combined memory').fill('Combined memory fixture');
+  await page.getByRole('button',{name:'Save combined memory'}).click();
+  await expect(page.getByText('Combined memory fixture',{exact:true})).toBeVisible();
+  await expect(page.getByText('Memory Alpha merge fixture',{exact:true})).toHaveCount(0);
+  const pending=page.waitForEvent('download');
+  await page.getByRole('button',{name:'Export memory'}).click();
+  expect((await pending).suggestedFilename()).toBe('kapron-memory.json');
+});
+
+test('Gem versions compare, restore and clone a saved configuration',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'Gems',exact:true}).click();
+  await page.getByRole('button',{name:'New Gem',exact:true}).click();
+  await page.getByLabel('Gem name').fill('Revision test Gem');
+  await page.getByRole('textbox',{name:'Instructions',exact:true}).fill('Original test instructions.');
+  await page.getByRole('button',{name:'Create Gem',exact:true}).click();
+  const card=page.getByRole('article').filter({hasText:'Revision test Gem'});
+  await card.getByRole('button',{name:'Edit Revision test Gem'}).click();
+  await page.getByRole('textbox',{name:'Instructions',exact:true}).fill('Changed test instructions.');
+  await page.getByRole('button',{name:'Save changes',exact:true}).click();
+  await card.getByRole('button',{name:'Gem versions'}).click();
+  await expect(page.getByText('Original test instructions.',{exact:true})).toBeVisible();
+  await expect(page.getByText('Changed test instructions.',{exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Restore as new version'}).click();
+  await expect(card).toContainText('v3');
+  await card.getByRole('button',{name:'Gem versions'}).click();
+  await page.getByRole('button',{name:'Clone configuration'}).click();
+  await expect(page.getByLabel('Gem name')).toHaveValue('Copy of Revision test Gem');
+  await page.getByRole('button',{name:'Create Gem',exact:true}).click();
+  await expect(page.getByRole('heading',{name:'Copy of Revision test Gem'})).toBeVisible();
+});
+
+test('Home surfaces a Cowork approval and replay pauses for a fresh decision',async({page})=>{
+  await page.goto('/');
+  const created=await page.request.post('/api/jobs',{headers:{'x-kapron-request':'1'},data:{
+    name:'Cowork approval fixture',connectionId:'demo',policy:'fixed',
+    nodes:[{type:'approval',note:'Confirm the review requirements.'}]
+  }});
+  expect(created.status()).toBe(202);
+  await page.getByRole('button',{name:'Home',exact:true}).click();
+  const action=page.getByRole('heading',{name:'Needs attention'}).locator('..');
+  await action.getByRole('button',{name:/Cowork approval fixture/}).click({timeout:15000});
+  await expect(page.getByText('Confirm the review requirements.')).toBeVisible();
+  await page.getByRole('button',{name:'Approve and continue'}).click();
+  await expect(page.getByRole('status').filter({hasText:'completed'})).toBeVisible();
+  await page.getByRole('button',{name:'Review replay'}).click();
+  await page.getByRole('button',{name:'Replay run',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Open original run'})).toBeVisible();
+  await page.getByRole('button',{name:'Reject and end run'}).click();
+  await expect(page.getByRole('status').filter({hasText:'cancelled'})).toBeVisible();
+});
+
+test('model arena compares two explicit destinations without private workspace context',async({page})=>{
+  await page.goto('/');
+  const current=await (await page.request.get('/api/workspace')).json();
+  current.state.connections.push({id:'arena-fixture',name:'Arena fixture model',provider:'custom',model:'arena/test',mode:'device',endpoint:'http://127.0.0.1:4187/arena-fixture'});
+  const saved=await page.request.put('/api/workspace',{headers:{'x-kapron-request':'1'},data:current});
+  expect(saved.status()).toBe(200);
+  let sent;
+  await page.route('**/arena-fixture/chat/completions',route=>{
+    sent=route.request().postDataJSON();
+    return route.fulfill({contentType:'text/event-stream',body:'data: '+JSON.stringify({choices:[{delta:{content:'Second result'}}]})+'\n\ndata: [DONE]\n\n'});
+  });
+  await page.reload();
+  await page.getByRole('button',{name:'Model arena',exact:true}).click();
+  await page.getByRole('group',{name:'Model B'}).getByRole('combobox',{name:'Connection'}).selectOption('arena-fixture');
+  await page.getByLabel('Comparison prompt').fill('Arena shared fixture');
+  await page.getByRole('button',{name:'Compare responses'}).click();
+  const results=page.getByRole('region',{name:'Comparison results'});
+  const winning=results.getByRole('article').filter({hasText:'Second result'});
+  await expect(results.getByRole('article').filter({hasText:'You asked:'})).toContainText('Arena shared fixture');
+  await expect(winning).toContainText('Second result');
+  await expect(winning).not.toContainText('Arena fixture model');
+  await winning.getByRole('button',{name:/Prefer Model/}).click();
+  await expect(winning.getByRole('button',{name:/Prefer Model/})).toHaveAttribute('aria-pressed','true');
+  await page.getByRole('button',{name:'Reveal models'}).click();
+  await expect(winning).toContainText('Arena fixture model');
+  await page.getByRole('button',{name:/preferred reply/}).click();
+  await expect(page.getByRole('article',{name:'Assistant reply'})).toContainText('Second result');
+  expect(sent.messages).toEqual([{role:'user',content:'Arena shared fixture'}]);
+});

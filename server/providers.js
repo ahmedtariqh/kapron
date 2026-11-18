@@ -24,6 +24,8 @@ export function providerRequest({ provider, model, endpoint, messages, instructi
   if (typeof model !== 'string' || !modelIdPattern.test(model)) throw new Error('Enter a valid model ID.');
   const headers = { 'content-type': 'application/json', accept: 'text/event-stream' };
   const config = {};
+  const jsonObject=options.responseFormat==='json_object';
+  if(jsonObject)instruction=[instruction,'Return only one valid JSON object. Use JSON without Markdown fences.'].filter(Boolean).join('\n\n');
   if (Number.isFinite(options.temperature)) config.temperature = Math.min(2, Math.max(0, options.temperature));
   if (Number.isInteger(options.maxOutput)) config.maxOutput = Math.min(32768, Math.max(16, options.maxOutput));
   if (provider === 'gemini') {
@@ -40,7 +42,8 @@ export function providerRequest({ provider, model, endpoint, messages, instructi
       method:'POST', headers, signal, redirect:'error',
       body:JSON.stringify({ contents, ...(instruction ? { systemInstruction:{ parts:[{text:instruction}] } } : {}),
         generationConfig: { ...(config.temperature != null ? {temperature:config.temperature} : {}),
-          ...(config.maxOutput ? {maxOutputTokens:config.maxOutput} : {}) } })
+          ...(config.maxOutput ? {maxOutputTokens:config.maxOutput} : {}),
+          ...(jsonObject?{responseMimeType:'application/json'}:{}) } })
     });
   }
   let url;
@@ -53,6 +56,7 @@ export function providerRequest({ provider, model, endpoint, messages, instructi
   return new Request(url, {
     method:'POST', headers, signal, redirect:'error', credentials:'omit',
     body:JSON.stringify({ model, stream:true,
+      ...(jsonObject?{response_format:{type:'json_object'}}:{}),
       ...(options.reportUsage && provider!=='custom' ? {stream_options:{include_usage:true}} : {}),
       ...(['low','medium','high'].includes(options.reasoningEffort)?{reasoning_effort:options.reasoningEffort}:{}),
       messages:[...(instruction ? [{role:'system',content:instruction}] : []),

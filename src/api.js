@@ -1,4 +1,5 @@
 import {providerRequest,sse,extractText,providerError} from '../server/providers.js';
+import {parseJsonObject} from '../server/structured.js';
 import {reportedUsage} from '../server/model-policy.js';
 
 export async function api(path,{method='GET',body,signal}={}) {
@@ -52,10 +53,12 @@ export async function streamRun({connection,model,context,options,user,signal,on
   } else {
     response=await api('runs',{method:'POST',body:{...input,...(key?{deviceKey:key}:{})},signal});
   }
-  let text='',done=false,usage,upstreamModel;
+  const structured=options?.responseFormat==='json_object';
+  let text='',done=false,usage,upstreamModel,finishReason;
   for await(const event of sse(response)){
     if(event.error) throw new Error(typeof event.error==='string'?event.error:'The provider ended the stream with an error.');
     if(event.done) done=true;
+    if(direct&&structured)finishReason=event.choices?.[0]?.finish_reason??event.candidates?.[0]?.finishReason??finishReason;
     const observed=direct?reportedUsage(connection.provider,event):event.usage;
     if(observed)usage={...usage,...observed};
     const identity=direct?(event.model??event.modelVersion):event.upstreamModel;
@@ -64,10 +67,15 @@ export async function streamRun({connection,model,context,options,user,signal,on
     if(typeof part!=='string' || !part)continue;
     text+=part;
     if(text.length>60_000)throw new Error('The reply exceeded the response size limit.');
-    onDelta(text);
+    if(!structured)onDelta(text);
   }
   if(!direct&&!done)throw new Error('The reply stream disconnected before completion.');
   if(!text)throw new Error('The provider returned no visible text.');
+  if(structured){
+    if(finishReason&&!['stop','STOP'].includes(finishReason))throw new Error('The provider stopped before completing the JSON response.');
+    parseJsonObject(text);
+    onDelta(text);
+  }
   onMetadata?.({usage,upstreamModel});
   return text;
 }

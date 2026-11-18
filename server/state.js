@@ -1,7 +1,7 @@
 import {autoConnection,retrieveKnowledge} from './routing.js';
 export const demoConnection = {id:'demo',provider:'demo',name:'Kapron Demo',model:'local-demo',mode:'demo'};
 export const initial = () => ({
-  projects: [], chats: [], gems: [], connections: [], memory: [], files: [], skills: [], knowledge: [], workflows: [], tasks: [], artifacts: [], goals: [],
+  projects: [], chats: [], gems: [], connections: [], memory: [], files: [], skills: [], knowledge: [], workflows: [], tasks: [], artifacts: [], goals: [], notebooks: [],
   settings: {defaultChoice:{connectionId:'demo',model:'local-demo'}, memoryEnabled:true},
 });
 
@@ -34,6 +34,18 @@ export function memoryContext(state, projectId){
   if(mode==='project')return {mode,entries:state.memory.filter(entry=>entry.projectId===project.id)};
   if(mode==='personal'&&state.settings.memoryEnabled)return {mode,entries:state.memory.filter(entry=>!entry.projectId)};
   return {mode:'disabled',entries:[]};
+}
+
+export function selectedMemory(state,projectId){
+  const {entries,mode}=memoryContext(state,projectId);
+  const selected=[];
+  let remaining=12000;
+  for(const entry of [...entries].sort((a,b)=>Number(b.pinned===true)-Number(a.pinned===true))){
+    if(typeof entry.text!=='string'||entry.text.length+1>remaining)continue;
+    remaining-=entry.text.length+1;
+    selected.push(entry);
+  }
+  return {mode,entries:selected};
 }
 
 export function historyBudget(chat, prompt, enabled = true, instruction = '') {
@@ -73,7 +85,7 @@ export function assembleContext(state,chat,gem,options,prompt, prior = '', routi
   if(options.history===true&&typeof chat.pinnedFacts==='string'&&chat.pinnedFacts.trim())parts.push('Facts pinned by the user in this chat:\n'+chat.pinnedFacts.trim().slice(0,4000));
   if (options.project && project?.instructions) parts.push('Project instructions:\n'+project.instructions);
   if(options.memory){
-    const memory=memoryContext(state,chat.projectId);
+    const memory=selectedMemory(state,chat.projectId);
     if(memory.entries.length)parts.push('User supplied '+memory.mode+' memory:\n'+memory.entries.map(entry=>entry.text).join('\n'));
   }
   if (options.gem && gem) {

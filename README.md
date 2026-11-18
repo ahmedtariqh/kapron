@@ -224,3 +224,15 @@ For Cowork and unattended workflows, use **Auto**, enable Jev classification, op
 - **Rerun with settings** and **Retry once** prepare a separate branch, then open context review. **Continue reply** prepares a follow-up that includes the recent conversation.
 - **Goals** tracks milestones with dates and links to saved chats, Canvas artifacts, workflows, and recent runs. **Library** organizes files, Canvas artifacts, and saved links. Canvas keeps up to five recent versions within its history size limit. Restore loads the earlier text in the editor for review before saving.
 - Read-only share links expire after 1, 7, or 30 days. Choose whether to offer the text download action. Workspace settings lists expiry dates and lets the owner revoke a link.
+
+### Workspace and workflow changes in 0.5.0-alpha.4
+
+- **Home** resumes recent conversations, files, Canvas artifacts and workflows. Its attention list opens background runs that need approval or intervention.
+- **Project overview** lists subprojects, chats, files, notebooks, knowledge, skills, workflows and selected Gems. Grouping projects leaves each project's context and memory scope independent.
+- **Notebooks** collect text and optional PDF excerpts with source notes and individual inclusion controls. Evidence search returns verbatim excerpts from enabled sources and keeps a history. Save an excerpt as a study card and review cards as they come due. The built-in notebook uses local lexical search. The separate NotebookLM integration uses its configured companion.
+- **Memory** supports source-chat links, reasons, budget priority, same-scope merge and JSON export. Usage links record successful interactive chat replies in this release.
+- **Workspace backup** is under the account menu. Restore creates copies and reconnects internal references. Map existing provider connections explicitly. Backups include private content and exclude credentials, live schedules, jobs, external shares and team membership.
+- **Gems, skills and workflows** keep up to five earlier configurations, subject to the workspace size limit. Compare and restore in each item's version history. Gem and skill packages can be reviewed before import. Imported skills start disabled. Workflow Gem steps can pin a retained release.
+- **Workflows** support prompt-based drafting, JSON field conditions with optional alternate branches, and explicit owner approvals. Cowork replay creates a fresh run with the stored input and expanded steps. It reads current project resources and requires fresh approvals.
+- Select **JSON object** under generation settings for a chat, project or Gem, or under step output in a workflow. Kapron validates the completed object before using it. Compatible integration clients can request `response_format: {"type":"json_object"}`.
+- **Model arena** compares two explicit model choices on the same prompt, offers an optional blind comparison, and saves the preferred reply in a chat. Results include response time and reported token counts after you reveal the models. Workspace context stays outside both requests.

@@ -70,8 +70,8 @@ export function RoutingSettings({state,settings,onClose,onSave,vaultAvailable}){
   </form></Modal>;
 }
 
-export function ResourceEditor({kind,entity,state,onClose,onSave}){
-  const [values,setValues]=useState({name:'',description:'',family:'general',projectId:'',text:'',enabled:true,...entity});
+export function ResourceEditor({kind,entity,seed,state,onClose,onSave}){
+  const [values,setValues]=useState({name:'',description:'',family:'general',projectId:'',text:'',enabled:true,...seed,...entity});
   const [error,setError]=useState(''),[busy,setBusy]=useState(false);
   const patch=(key,value)=>setValues(v=>({...v,[key]:value}));
   const skill=kind==='skill', title=skill?'skill':'knowledge source';

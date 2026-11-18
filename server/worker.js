@@ -3,6 +3,10 @@ import {providers, providerRequest, sse, extractText, providerError, isGateway} 
 import {gatewayConfig, gatewayModels} from './gateway.js';
 import {estimateRun,reportedUsage} from './model-policy.js';
 import {initial} from './state.js';
+import {revisionHistoryValid} from './revisions.js';
+import {projectHierarchyValid} from './projects.js';
+import {parseJsonObject,responseFormatValid} from './structured.js';
+import {notebookValid} from './notebooks.js';
 import {seal, unseal} from './vault.js';
 import {authenticate,authenticatedOwner} from './auth.js';
 import {collaboration} from './collaboration.js';
@@ -10,7 +14,7 @@ import {notebookAvailable,notebookCall} from './notebooklm.js';
 import {voiceRequest} from './voice.js';
 import {mediaRequest} from './media.js';
 import {decideWithJev} from './decision-service.js';
-import {apiKeyOwner,changeJob,createApiKey,createShare,enqueueJob,getJob,listApiKeys,listJobs,listShares,loadWorkspace,revokeApiKey,revokeShare,setSchedule,sharedSnapshot,tickJobs} from './jobs.js';
+import {apiKeyOwner,changeJob,createApiKey,createShare,enqueueJob,getJob,listApiKeys,listJobs,listShares,loadWorkspace,replayJob,revokeApiKey,revokeShare,setSchedule,sharedSnapshot,tickJobs} from './jobs.js';
 
 const noCache={'cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'};
 class Problem extends Error { constructor(status,message){super(message);this.status=status;} }
@@ -42,14 +46,18 @@ function workspaceValid(s) {
   const lists=['projects','chats','gems','connections','memory','files'];
   if(!s || !s.settings || lists.some(k=>!Array.isArray(s[k]))) return false;
   if(lists.some(k=>s[k].length>250 || s[k].some(x=>!x || !keyId(x.id)))) return false;
+  if(!projectHierarchyValid(s.projects)||s.projects.some(project=>project.gemIds!==undefined&&(!Array.isArray(project.gemIds)||
+    project.gemIds.length>250||project.gemIds.some(id=>!keyId(id)||!s.gems.some(gem=>gem.id===id)))))return false;
   if(s.chats.some(c=>!Array.isArray(c.messages) || c.messages.length>500 ||
     c.messages.some(m=>!m || !keyId(m.id) || !['assistant','user'].includes(m.role) || typeof m.text!=='string'))) return false;
   if(s.chats.some(c=>(c.folder!==undefined&&(typeof c.folder!=='string'||c.folder.length>80))||
     (c.pinnedFacts!==undefined&&(typeof c.pinnedFacts!=='string'||c.pinnedFacts.length>4000))||
     (c.historyChars!==undefined&&(!Number.isInteger(c.historyChars)||c.historyChars<2000||c.historyChars>150000))||
     (c.labels!==undefined&&(!Array.isArray(c.labels)||c.labels.length>12||c.labels.some(label=>typeof label!=='string'||label.length>32)))))return false;
-  const extensions=['skills','knowledge','workflows','tasks','artifacts','goals'];
+  const extensions=['skills','knowledge','workflows','tasks','artifacts','goals','notebooks'];
   if(extensions.some(k=>s[k]!==undefined && (!Array.isArray(s[k])||s[k].length>250||s[k].some(x=>!x||!keyId(x.id)))))return false;
+  if([s.gems,s.workflows??[],s.skills??[]].some(records=>records.some(item=>!revisionHistoryValid(item))))return false;
+  if((s.notebooks??[]).some(item=>!notebookValid(item)||(item.projectId&&!s.projects.some(project=>project.id===item.projectId))))return false;
   if((s.goals??[]).some(goal=>!['active','paused','done'].includes(goal.status)||typeof goal.title!=='string'||!goal.title.trim()||goal.title.length>120||
     typeof goal.description!=='string'||goal.description.length>4000||!Array.isArray(goal.milestones)||goal.milestones.length>25||
     goal.milestones.some(item=>!item||!keyId(item.id)||typeof item.title!=='string'||!item.title.trim()||item.title.length>120||typeof item.done!=='boolean')||
@@ -123,7 +131,7 @@ function validateRun(input) {
   if(!input || !keyId(input.connectionId) || typeof input.model!=='string' || input.model.length>160 ||
     !Array.isArray(input.messages) || !input.messages.length || input.messages.length>32 ||
     input.messages.some(m=>!m || !['user','assistant'].includes(m.role) || typeof m.text!=='string' || m.text.length>40_000) ||
-    typeof input.instruction!=='string' || input.instruction.length>50_000) throw new Problem(400,'Invalid chat request.');
+    !responseFormatValid(input.options?.responseFormat) || typeof input.instruction!=='string' || input.instruction.length>50_000) throw new Problem(400,'Invalid chat request.');
 }
 function delay(ms,signal) {
   return new Promise(resolve=>{
@@ -135,6 +143,10 @@ function delay(ms,signal) {
 async function* demoReply(input,signal) {
   const request=input.messages.at(-1).text.trim().split('\n').at(-1).slice(0,300);
   const cleaned=request.replace(/[\[\]<>*_~`]/g,'').replace(/\s+/g,' ');
+  if(input.options?.responseFormat==='json_object'){
+    yield JSON.stringify({request:cleaned,mode:'demo'});
+    return;
+  }
   const extra=input.instruction.includes('Gem instructions:') ? 'The selected Gem’s instructions were included in this run.\n\n' : '';
   const answer='### A starting point\n\nYou asked: **'+cleaned+'**\n\n'+extra+
     '1. **Define the outcome.** Write one sentence describing what a successful result looks like.\n'+
@@ -201,7 +213,8 @@ async function run(request,env,owner) {
     }
     if(!upstream.ok){await upstream.body?.cancel();throw new Problem(502,providerError(upstream.status));}
     const chunks=(async function*(){
-      let count=0, usage, upstreamModel, finishReason;
+      let count=0, usage, upstreamModel, finishReason, structuredText='';
+      const structured=input.options?.responseFormat==='json_object';
       for await (const event of sse(upstream)) {
         const observed=reportedUsage(connection.provider,event);
         if(observed)usage={...usage,...observed};
@@ -214,9 +227,14 @@ async function run(request,env,owner) {
         if(!chunk) continue;
         count+=chunk.length;
         if(count>60_000) throw new Error('The reply exceeded the response size limit.');
-        yield chunk;
+        if(structured)structuredText+=chunk;else yield chunk;
       }
       if(!count) throw new Error('The provider returned no visible text.');
+      if(structured){
+        if(finishReason)throw new Error('The provider stopped before completing the JSON response.');
+        parseJsonObject(structuredText);
+        yield structuredText;
+      }
       if(usage||upstreamModel)yield {usage,upstreamModel};
       return finishReason;
     })();
@@ -268,15 +286,18 @@ function integrationMessages(messages){
 
 async function integrationChat(request,env,owner){
   const input=await readJson(request,250000);
-  const supported=['model','messages','stream','stream_options','max_completion_tokens','max_tokens','temperature'];
+  const supported=['model','messages','stream','stream_options','max_completion_tokens','max_tokens','temperature','response_format'];
   if(!input||Array.isArray(input)||Object.keys(input).some(key=>!supported.includes(key)))throw new Problem(400,'Unsupported chat completion field.');
+  const format=input.response_format;
+  if(format!==undefined&&(!format||typeof format!=='object'||Array.isArray(format)||Object.keys(format).length!==1||
+    !['text','json_object'].includes(format.type)))throw new Problem(400,'Use a text or json_object response format.');
   const context=integrationMessages(input.messages);
   const target=(await integrationModels(env,owner)).find(connection=>connection.id===input.model);
   if(!target)throw new Problem(404,'Select a vault model ID from the Kapron model list.');
   const maxOutput=input.max_completion_tokens??input.max_tokens;
   if(maxOutput!==undefined&&(!Number.isInteger(maxOutput)||maxOutput<16||maxOutput>32768))throw new Problem(400,'Use an output token limit from 16 to 32,768.');
   const requestUsage=input.stream_options?.include_usage===true;
-  const payload={...context,connectionId:target.id,model:target.model,options:{maxOutput,temperature:input.temperature,reportUsage:target.capability?.reportUsage===true}};
+  const payload={...context,connectionId:target.id,model:target.model,options:{maxOutput,responseFormat:format?.type,temperature:input.temperature,reportUsage:target.capability?.reportUsage===true}};
   const response=await run(new Request(request.url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload),signal:request.signal}),env,{id:owner});
   const id='chatcmpl-'+crypto.randomUUID();
   const created=Math.floor(Date.now()/1000);
@@ -481,10 +502,17 @@ async function api(request,env,path) {
     if(!input||typeof input!=='object')throw new Problem(400,'Enter a run definition.');
     return json(await enqueueJob(env,owner.id,input),202);
   }
+  const replay=path.match(/^\/api\/jobs\/([a-zA-Z0-9-]{1,180})\/replay$/);
+  if(replay&&method==='POST')return json(await replayJob(env,owner.id,replay[1]),202);
   const job=path.match(/^\/api\/jobs\/([a-zA-Z0-9-]{1,180})$/);
+  if(job&&method==='GET'){
+    const record=await getJob(env,owner.id,job[1]);
+    if(!record)throw new Problem(404,'Run unavailable.');
+    return json(record);
+  }
   if(job&&method==='PATCH'){
-    const {action}=await readJson(request,300);
-    return json(await changeJob(env,owner.id,job[1],action));
+    const {action,step}=await readJson(request,300)??{};
+    return json(await changeJob(env,owner.id,job[1],action,step));
   }
   const schedule=path.match(/^\/api\/schedules\/([a-zA-Z0-9-]{1,80})$/);
   if(schedule&&method==='PUT'){

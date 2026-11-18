@@ -5,7 +5,7 @@ import {Modal} from './dialogs.jsx';
 const collections = [
   ['chat','chats','Chat'],['project','projects','Project'],['gem','gems','Gem'],
   ['workflow','workflows','Workflow'],['artifact','artifacts','Canvas'],['file','files','File'],
-  ['skill','skills','Skill'],['knowledge','knowledge','Knowledge'],['connection','connections','Model connection']
+  ['skill','skills','Skill'],['notebook','notebooks','Notebook'],['knowledge','knowledge','Knowledge'],['connection','connections','Model connection']
 ];
 const searchable=value=>String(value??'').normalize('NFKC').toLocaleLowerCase();
 const timestamp=value=>typeof value==='number'?value:Date.parse(value);
@@ -13,7 +13,7 @@ const timestamp=value=>typeof value==='number'?value:Date.parse(value);
 function entries(state, runs){
   const local=collections.flatMap(([kind,key,category])=>(state[key]??[]).map(item=>({
     item,kind,category,title:item.title??item.name??'Untitled',projectId:item.projectId??'',
-    date:item.updated??item.created,body:[item.text,item.description,item.instructions,item.knowledge,...(item.labels??[]),...(item.messages??[]).map(message=>message.text)].filter(Boolean).join('\n')
+    date:item.updated??item.created,body:[item.text,item.description,item.instructions,item.knowledge,...(kind==='notebook'?item.sources.map(source=>source.name+' '+source.notes):[]),...(item.labels??[]),...(item.messages??[]).map(message=>message.text)].filter(Boolean).join('\n')
   })));
   return [...local,...runs.map(item=>({item,kind:'run',category:'Run',title:item.definition.name,projectId:item.definition.projectId??'',
     date:item.updated??item.created,body:item.outputs.map(output=>output.text??'').join('\n')}))];

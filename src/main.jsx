@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {ArrowDown,ArrowDownToLine,ArrowRight,ArrowUp,ArrowUpRight,Bookmark,BookOpen,Brain,Copy,Folder,Gem,GitBranch,Image,KeyRound,Mic,Volume2,Menu,MessageSquare,PanelRight,Paperclip,Pencil,Plus,Quote,Search,Settings2,Sparkles,Square,ThumbsDown,ThumbsUp,Trash2,X,Zap} from 'lucide-react';
 import {providers,isGateway} from '../server/providers.js';
-import {defaultContext,getConnection,initial,memoryContext,modelOptions} from '../server/state.js';
+import {defaultContext,getConnection,initial,memoryContext,modelOptions,selectedMemory} from '../server/state.js';
 import {estimateRun} from '../server/model-policy.js';
 import {api,get,removeDeviceKey,saveDeviceKey,streamRun} from './api.js';
 import {ConnectionEditor,EntityEditor,GemPicker,Modal,RunReview,SelectModel} from './dialogs.jsx';
@@ -20,6 +20,18 @@ import {ChatHistory,ChatImport} from './history.jsx';
 import {WorkspaceSearch} from './workspace-search.jsx';
 import {WorkspaceLibrary} from './workspace-library.jsx';
 import {Goals} from './goals.jsx';
+import {Home} from './home.jsx';
+import {ModelArena} from './model-arena.jsx';
+import {RevisionHistory} from './revisions.jsx';
+import {AssistantImport} from './assistant-import.jsx';
+import {exportAssistantPackage} from './assistant-packages.js';
+import {nextRevision} from '../server/revisions.js';
+import {ProjectOverview} from './project-overview.jsx';
+import {projectHierarchyValid} from '../server/projects.js';
+import {MemoryManager} from './memory.jsx';
+import {Notebooks} from './notebooks.jsx';
+import {WorkspacePortability} from './workspace-portability.jsx';
+import {exportWorkspace,restoreWorkspaceBackup} from './workspace-backup.js';
 import {exportChatBundle,findChats,importChatBundle} from './chat-library.js';
 import {Dictation,LiveVoice,LiveVoiceButton} from './voice.jsx';
 import {attachmentAccept,attachmentText,isPdf} from './attachments.js';
@@ -61,7 +73,7 @@ function Intro({project,onStarter}){
     <div className="starter-grid">{starters.map(({Icon,title,text,color})=><button className="starter" key={title} onClick={()=>onStarter(text)}><span className={'starter-icon '+color}><Icon size={17}/></span><strong>{title}</strong><ArrowRight className="starter-arrow" size={15}/></button>)}</div>
   </div>;
 }
-function Message({message,onInspect,onCopy,onArtifact,onBranch,onQuote,onMark,onRerun,onRetry,onContinue,live}){
+function Message({message,onInspect,onCopy,onArtifact,onBranch,onQuote,onMark,onRerun,onRetry,onContinue,onRemember,live}){
   const own=message.role==='user';
   return <article className={'message '+(own?'human':'assistant')} aria-label={own?'Your message':'Assistant reply'}>
     {!own&&<div className="message-avatar">{message.gemName?<Gem size={17}/>:<img src="/icon.svg" alt=""/>}</div>}
@@ -69,7 +81,7 @@ function Message({message,onInspect,onCopy,onArtifact,onBranch,onQuote,onMark,on
       {!own&&<div className="message-label"><strong>{message.gemName||'Assistant'}</strong>{message.providerName&&<span>{message.providerName}</span>}{message.stopped&&<span>Stopped</span>}</div>}
       <div className={'message-text'+(live?' live':'')}>
         {own?<span dir="auto">{message.text}</span>:message.text?<div dir="auto"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{img:()=>null,a:({children,href})=><a href={href} target="_blank" rel="noreferrer">{children}</a>,
-          pre:({children})=><div className="message-code" dir="ltr">{!live&&<button className="plain-button" onClick={()=>onCopy(renderedText(children))}><Copy size={14}/>Copy code</button>}<pre>{children}</pre></div>}}>{message.text}</ReactMarkdown></div>:live?<span className="typing" aria-label="Waiting for reply"><i/><i/><i/></span>:null}
+          pre:({children})=><div className="message-code" dir="ltr">{!live&&<button className="plain-button" onClick={()=>onCopy(renderedText(children))}><Copy size={14}/>Copy code</button>}<pre>{children}</pre></div>}}>{message.options?.responseFormat==='json_object'?'```json\n'+message.text+'\n```':message.text}</ReactMarkdown></div>:live?<span className="typing" aria-label="Waiting for reply"><i/><i/><i/></span>:null}
       </div>
       {message.error&&<p className="form-error" role="alert">{message.error}</p>}
       {own&&onBranch&&<div className="message-actions"><IconButton Icon={GitBranch} label="Branch from this message" onClick={onBranch}/></div>}
@@ -81,6 +93,7 @@ function Message({message,onInspect,onCopy,onArtifact,onBranch,onQuote,onMark,on
         {onMark&&<><IconButton Icon={Bookmark} label="Bookmark reply" pressed={message.bookmarked===true} onClick={()=>onMark('bookmarked',true)}/>
           <IconButton Icon={ThumbsUp} label="Rate reply helpful" pressed={message.rating==='helpful'} onClick={()=>onMark('rating','helpful')}/>
           <IconButton Icon={ThumbsDown} label="Rate reply unhelpful" pressed={message.rating==='unhelpful'} onClick={()=>onMark('rating','unhelpful')}/></>}
+        {onRemember&&<button className="plain-button" disabled={!message.text} onClick={onRemember}>Save to memory</button>}
         {onArtifact&&<IconButton Icon={Pencil} label="Open reply in Canvas" onClick={()=>onArtifact(message.text)} disabled={!message.text}/>}
         {'speechSynthesis' in window&&<IconButton Icon={Volume2} label="Read aloud" onClick={()=>{speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(message.text));}} disabled={!message.text}/>}</div>}
     </div>
@@ -89,6 +102,7 @@ function Message({message,onInspect,onCopy,onArtifact,onBranch,onQuote,onMark,on
 function Workspace(){
   const [data,setData]=useState(null),[session,setSession]=useState(null),[loadError,setLoadError]=useState(''),[authMode,setAuthMode]=useState(null);
   const latest=useRef(null),queue=useRef(Promise.resolve()),abort=useRef(null);
+  const [notebookId,setNotebookId]=useState(null),[projectOverviewId,setProjectOverviewId]=useState(null);
   const [integrations,setIntegrations]=useState({}),[view,setView]=useState('chat'),[chatId,setChatId]=useState(null),[projectId,setProjectId]=useState(null);
   const [temporaryChat,setTemporaryChat]=useState(null);
   const [web,setWeb]=useState(false);
@@ -101,6 +115,7 @@ function Workspace(){
   const temporary=!!temporaryChat;
   const chat=temporaryChat??state.chats.find(x=>x.id===chatId);
   const project=state.projects.find(x=>x.id===(chat?.projectId??projectId));
+  const overview=state.projects.find(item=>item.id===projectOverviewId);
   const active=state.gems.find(x=>x.id===chat?.activeGemId);
   const settings=modelOptions(state,chat??{projectId},null);
   const temporaryChoice=temporary?(chat.choice??(settings[0]?.choice.connectionId==='auto'?{connectionId:'demo',model:'local-demo'}:settings[0]?.choice)):null;
@@ -158,7 +173,7 @@ function Workspace(){
   }
   const safe=(fn)=>Promise.resolve().then(fn).catch(e=>show(e.message));
   function discardTemporary(){if(temporary){abort.current?.abort();setTemporaryChat(null);setNotice('');setLive(null);setDraft('');}}
-  function navigate(destination){if(destination!=='chat')discardTemporary();if(destination==='integrations')get('integrations').then(setIntegrations,e=>show(e.message));setView(destination);setNav(false);setInspect(null);}
+  function navigate(destination){if(destination!=='chat')discardTemporary();if(destination==='projects')setProjectOverviewId(null);if(destination==='integrations')get('integrations').then(setIntegrations,e=>show(e.message));setView(destination);setNav(false);setInspect(null);}
   function openChat(c){
     discardTemporary();
     setChatId(c.id);setProjectId(c.projectId);setSelection(null);setNotice('');scrollLock.current=false;navigate('chat');setDialog(null);
@@ -221,8 +236,15 @@ function Workspace(){
       await persist(s=>updateChat(s,newId,c=>({...c,...values,updated:now()})));
       setProjectId(values.projectId);
     }else{
-      const next={...entity,...values,id:newId,updated:now(),...(type==='gem'?{version:(entity?.version??0)+1}:{})};
-      await persist(s=>({...s,[key]:entity?s[key].map(x=>x.id===newId?next:x):[next,...s[key]]}));
+      const updated=now();
+      await persist(s=>{
+        if(entity&&!s[key].some(item=>item.id===entity.id&&item.updated===entity.updated))throw new Error('This '+type+' changed. Reopen its latest version.');
+        const previous=s[key].find(item=>item.id===newId);
+        const next=type==='gem'?{...nextRevision('gem',previous,values,updated),id:newId}:{...previous,...values,id:newId,updated};
+        const records=entity?s[key].map(x=>x.id===newId?next:x):[next,...s[key]];
+        if(type==='project'&&!projectHierarchyValid(records))throw new Error('Choose an existing parent outside this project’s descendants. Up to eight levels are available.');
+        return {...s,[key]:records};
+      });
     }
     setDialog(null);show(type==='gem'?'Gem saved':type==='project'?'Project saved':'Chat updated');
   }
@@ -253,13 +275,20 @@ function Workspace(){
     await persist(s=>{
       const result={...s,[key]:(s[key]??[]).filter(x=>x.id!==entity.id)};
       if(type==='project'){
+        const removed=s.projects.find(item=>item.id===entity.id);
+        result.projects=result.projects.map(item=>item.parentId===entity.id?{...item,parentId:removed?.parentId??null,updated:now()}:item);
+        result.workflows=(s.workflows??[]).filter(item=>item.projectId!==entity.id);
+        result.notebooks=(s.notebooks??[]).filter(item=>item.projectId!==entity.id);
         result.chats=s.chats.map(c=>c.projectId===entity.id?{...c,projectId:null}:c);
         result.memory=s.memory.filter(entry=>entry.projectId!==entity.id);
         result.goals=(s.goals??[]).map(goal=>goal.projectId===entity.id?{...goal,projectId:null}:goal);
         for(const k of ['skills','knowledge'])result[k]=(s[k]??[]).filter(x=>x.projectId!==entity.id);
       }
       if(type==='chat'||type==='project')result.files=s.files.filter(f=>type==='chat'?f.chatId!==entity.id:f.projectId!==entity.id||f.chatId).map(f=>type==='project'&&f.projectId===entity.id?{...f,projectId:null}:f);
-      if(type==='gem')result.chats=s.chats.map(c=>c.activeGemId===entity.id?{...c,activeGemId:null}:c);
+      if(type==='gem'){
+        result.chats=s.chats.map(c=>c.activeGemId===entity.id?{...c,activeGemId:null}:c);
+        result.projects=s.projects.map(item=>item.gemIds?.includes(entity.id)?{...item,gemIds:item.gemIds.filter(id=>id!==entity.id),updated:now()}:item);
+      }
       if(type==='connection'){
         for(const k of ['chats','projects','gems'])result[k]=s[k].map(x=>x.choice?.connectionId===entity.id?{...x,choice:null}:x);
         if(s.settings.defaultChoice?.connectionId===entity.id)result.settings={...s.settings,defaultChoice:initial().settings.defaultChoice};
@@ -373,6 +402,7 @@ function Workspace(){
             onMetadata:metadata=>Object.assign(out,metadata),
             onDelta:text=>{out.text=text;repaint();}});
           out.latencyMs=Math.round(performance.now()-started);
+          if(r.scope.memory)out.memoryIds=selectedMemory(prepared,inputChat.projectId).entries.map(entry=>entry.id);
         }catch(e){
           if(controller.signal.aborted||e.name==='AbortError')out.stopped=true;
           else out.error=e.message;
@@ -423,6 +453,19 @@ function Workspace(){
   async function archiveChats(ids, archived){
     const selected=new Set(ids);
     await persist(current=>({...current,chats:current.chats.map(entry=>selected.has(entry.id)?{...entry,archived}:entry)}));
+  }
+  async function saveNotebook(values){
+    const notebookId=values.id??id();
+    const updated=now();
+    const next=await persist(current=>{
+      const notebooks=current.notebooks??[];
+      const previous=notebooks.find(item=>item.id===notebookId);
+      if(values.id&&(!previous||previous.updated!==values.updated))throw new Error('This notebook changed. Reopen the current version.');
+      if(values.projectId&&!current.projects.some(project=>project.id===values.projectId))throw new Error('This project is unavailable.');
+      const entry={sources:[],history:[],cards:[],...values,id:notebookId,updated,created:previous?.created??updated};
+      return {...current,notebooks:[entry,...notebooks.filter(item=>item.id!==notebookId)]};
+    });
+    return next.notebooks.find(item=>item.id===notebookId);
   }
   async function saveGoal(values){
     const goalId=values.id??id();
@@ -476,21 +519,54 @@ function Workspace(){
     setDialog({type:'share',url:new URL('/?share='+value.id,location.origin).href});
   }
   async function saveWorkflow(entity,values){
-    const entry={...values,id:entity?.id??id(),version:(entity?.version??0)+1};
-    if(!entry.name)throw new Error('Enter a workflow name.');
-    expandWorkflow(latest.current.state,entry);
-    await persist(s=>({...s,workflows:[entry,...(s.workflows??[]).filter(x=>x.id!==entry.id)]}));
-    await get('schedules/'+entry.id,{method:'PUT'});setDialog(null);show('Workflow saved');
+    const workflowId=entity?.id??id(), updated=now();
+    if(!values.name?.trim())throw new Error('Enter a workflow name.');
+    await persist(s=>{
+      const previous=(s.workflows??[]).find(item=>item.id===workflowId);
+      if(entity&&(!previous||previous.version!==entity.version||previous.updated!==entity.updated))throw new Error('This workflow changed. Reopen its latest version.');
+      const entry={...nextRevision('workflow',previous,values,updated),id:workflowId,scheduleMinutes:values.scheduleMinutes??0};
+      expandWorkflow(s,entry);
+      return {...s,workflows:[entry,...(s.workflows??[]).filter(item=>item.id!==entry.id)]};
+    });
+    await get('schedules/'+workflowId,{method:'PUT'});setDialog(null);show('Workflow saved');
+  }
+  async function saveResource(kind,entity,values){
+    const key=kind==='skill'?'skills':'knowledge', resourceId=entity?.id??id(), updated=now();
+    await persist(s=>{
+      const previous=(s[key]??[]).find(item=>item.id===resourceId);
+      if(entity&&(!previous||previous.version!==entity.version||previous.updated!==entity.updated))throw new Error('This resource changed. Reopen its latest version.');
+      if(values.projectId&&!s.projects.some(project=>project.id===values.projectId))throw new Error('The resource project is unavailable.');
+      const config=kind==='skill'?nextRevision(kind,previous,values,updated):{...values,updated};
+      return {...s,[key]:[{...config,id:resourceId},...(s[key]??[]).filter(item=>item.id!==resourceId)]};
+    });
+    close();show('Resource saved');
   }
   async function queueJob(values){
     if(!values.name)throw new Error('Enter a name for this run.');
     await get('jobs',{method:'POST',body:values});
     setDialog(null);navigate('jobs');show('Run queued');
   }
+  async function promoteArenaReply(prompt,result){
+    const target=chat??makeChat(project?.id,toTitle(prompt));
+    const created=now();
+    const messages=[{id:id(),role:'user',text:prompt,created},{id:id(),role:'assistant',text:result.text,created,
+      mode:'Model arena',model:result.model,upstreamModel:result.upstreamModel,connectionId:result.connectionId,
+      provider:result.provider,providerName:result.providerName,usage:result.usage,bookmarked:true,latencyMs:result.duration,estimatedUsd:result.estimatedUsd}];
+    const saved=await persist(current=>{
+      const previous=current.chats.find(item=>item.id===target.id);
+      if(chat&&!previous)throw new Error('This chat is unavailable. Open the arena from another chat.');
+      if((previous?.messages.length??0)+messages.length>500)throw new Error('This chat is full.');
+      const entry={...(previous??target),updated:created,messages:[...(previous?.messages??[]),...messages]};
+      return {...current,chats:[entry,...current.chats.filter(item=>item.id!==target.id)]};
+    });
+    openChat(saved.chats.find(item=>item.id===target.id));
+    show('Preferred reply saved');
+  }
   function openSearch(){setDialog({type:'search'});}
   function openSearchResult(kind,item){
     if(kind==='chat'){openChat(item);return;}
-    if(kind==='project'){startChat(item.id);setDialog(null);return;}
+    if(kind==='notebook'){setNotebookId(item.id);navigate('notebooks');setDialog(null);return;}
+    if(kind==='project'){navigate('projects');setProjectOverviewId(item.id);setDialog(null);return;}
     if(kind==='run'){setSelectedRun(item.id);navigate('jobs');setDialog(null);return;}
     const destination={gem:'gems',file:'projects',artifact:'artifacts',skill:'skills',knowledge:'knowledge',workflow:'workflows',connection:'connections'}[kind];
     if(kind!=='file')navigate(destination);
@@ -511,7 +587,7 @@ function Workspace(){
       <button className="nav-item" disabled={running} onClick={startTemporary}><MessageSquare size={16}/>Temporary chat</button>
       <button className="nav-item" onClick={()=>setDialog({type:'history'})}><BookOpen size={16}/>Chat history</button>
       <div className="sidebar-nav"><p className="eyebrow">WORKSPACE</p>
-        {[['projects','Projects',Folder],['goals','Goals',Bookmark],['library','Library',BookOpen],['shared','Shared projects',Folder],['gems','Gems',Gem],['memory','Memory',Brain],['skills','Skills',Zap],['knowledge','Knowledge',BookOpen],['workflows','Workflows',GitBranch],['jobs','Cowork',Zap],['artifacts','Canvas',Pencil],['studio','Studio',Image],['integrations','Integrations',BookOpen],['connections','Connections',KeyRound]].map(([v,label,Icon])=><button key={v} className={'nav-item'+(view===v?' selected':'')} onClick={()=>navigate(v)}><Icon size={17}/>{label}</button>)}
+        {[['home','Home',Folder],['projects','Projects',Folder],['notebooks','Notebooks',BookOpen],['goals','Goals',Bookmark],['library','Library',BookOpen],['shared','Shared projects',Folder],['gems','Gems',Gem],['memory','Memory',Brain],['skills','Skills',Zap],['knowledge','Knowledge',BookOpen],['workflows','Workflows',GitBranch],['jobs','Cowork',Zap],['artifacts','Canvas',Pencil],['studio','Studio',Image],['integrations','Integrations',BookOpen],['connections','Connections',KeyRound],['arena','Model arena',GitBranch]].map(([v,label,Icon])=><button key={v} className={'nav-item'+(view===v?' selected':'')} onClick={()=>navigate(v)}><Icon size={17}/>{label}</button>)}
       </div>
       <div className="recent">
         <div className="recent-label"><p className="eyebrow">{projectId?project?.name||'PROJECT CHATS':'RECENT CHATS'}</p>{projectId&&<IconButton Icon={X} label="Show all chats" onClick={()=>{setProjectId(null);setChatId(null);}}/>}</div>
@@ -537,7 +613,8 @@ function Workspace(){
         <div className="chat-main">
           <div ref={list} className="conversation" onScroll={e=>{const n=e.currentTarget;scrollLock.current=n.scrollHeight-n.scrollTop-n.clientHeight>120;}}>
             {!chat?.messages.length&&live?.chatId!==visibleChatId?<Intro project={project} onStarter={text=>{changeDraft(text);composer.current?.focus();}}/>:<div className="messages">
-              {chat?.messages.map(m=><Message key={m.id} message={m} onInspect={m=>setInspect({type:'run',message:m})} onCopy={copy} onBranch={!temporary&&!running?()=>setDialog({type:'branch',message:m}):undefined} onQuote={!running?()=>quote(m.text):undefined} onMark={temporary?undefined:(field,value)=>mark(m,field,value)} onArtifact={temporary?undefined:text=>setDialog({type:'artifact',entity:{name:chat?.title||'Reply',text,origin:{kind:'chat',id:chat.id,messageId:m.id}}})}
+              {chat?.messages.map(m=><Message key={m.id} message={m} onInspect={m=>setInspect({type:'run',message:m})} onCopy={copy} onBranch={!temporary&&!running?()=>setDialog({type:'branch',message:m}):undefined} onQuote={!running?()=>quote(m.text):undefined} onMark={temporary?undefined:(field,value)=>mark(m,field,value)}
+                onRemember={temporary||m.role!=='assistant'?undefined:()=>setDialog({type:'memory',seed:{text:m.text.slice(0,2000),projectId:chat.projectId,origins:[{kind:'chat',id:chat.id,messageId:m.id}]}})} onArtifact={temporary?undefined:text=>setDialog({type:'artifact',entity:{name:chat?.title||'Reply',text,origin:{kind:'chat',id:chat.id,messageId:m.id}}})}
                 onRerun={!running&&!temporary&&m.role==='assistant'&&promptFor(m)?()=>setDialog({type:'rerun',message:m}):undefined}
                 onRetry={!running&&!temporary&&m.role==='assistant'&&(m.error||m.stopped)&&m.mode!=='retry'&&promptFor(m)&&!state.chats.some(entry=>entry.branchParent?.chatId===chat.id&&entry.retryOf===m.id)?()=>setDialog({type:'rerun',message:m,retry:true}):undefined}
                 onContinue={!running&&m.role==='assistant'&&m.text&&chat.messages.at(-1)?.id===m.id?continueReply:undefined}/>)}
@@ -583,21 +660,33 @@ function Workspace(){
           </div>}
         </aside>}
       </div>:<section className="workspace-page">
+        {view==='arena'&&<ModelArena state={state} user={user} offline={offline} chatTitle={chat?.title} onPromote={promoteArenaReply}/>}
+        {view==='home'&&<Home state={state} onOpen={openSearchResult} onNewChat={()=>startChat(null)}/>}
+        {view==='notebooks'&&<Notebooks key={notebookId??'all'} initialId={notebookId} state={state} onSave={saveNotebook}
+          onDelete={notebookId=>persist(current=>({...current,notebooks:(current.notebooks??[]).filter(item=>item.id!==notebookId)}))}/>}
         {view==='goals'&&<Goals state={state} onSave={saveGoal} onOpen={openSearchResult}/>}
         {view==='library'&&<WorkspaceLibrary state={state} onOpen={openSearchResult} onAdd={addLibraryItem} onOrganize={organizeLibraryItem} onOrigin={openLibraryOrigin}/>}
-        {view==='projects'&&<><PageTitle Icon={Folder} label="ORGANIZE YOUR WORK" title="Projects" description="Group conversations and set the model, instructions, and memory for each project." action="New project" onAction={()=>setDialog({type:'entity',kind:'project'})}/>
-          <CardGrid items={state.projects} Icon={Folder} emptyTitle="Create your first project" emptyDescription="Start a space for a project you return to often." onCreate={()=>setDialog({type:'entity',kind:'project'})} onEdit={p=>setDialog({type:'entity',kind:'project',entity:p})} onRemove={p=>askRemove('project',p)} detail={p=>state.chats.filter(c=>c.projectId===p.id).length+' chats'} action="Open project" onOpen={p=>startChat(p.id)}/></>}
+        {view==='projects'&&overview&&<ProjectOverview project={overview} state={state} onOpen={openSearchResult} onBack={()=>setProjectOverviewId(null)}
+          onChat={()=>startChat(overview.id)} onEdit={()=>setDialog({type:'entity',kind:'project',entity:overview})}
+          onChild={()=>setDialog({type:'entity',kind:'project',parentId:overview.id})}
+          onFile={()=>setDialog({type:'project-file',project:overview})}
+          onManageGems={()=>setDialog({type:'project-gems',entity:overview})}/>}
+        {view==='projects'&&!overview&&<><PageTitle Icon={Folder} label="ORGANIZE YOUR WORK" title="Projects" description="Group conversations and set the model, instructions, and memory for each project." action="New project" onAction={()=>setDialog({type:'entity',kind:'project'})}/>
+          <CardGrid items={state.projects} Icon={Folder} emptyTitle="Create your first project" emptyDescription="Start a space for a project you return to often." onCreate={()=>setDialog({type:'entity',kind:'project'})} onEdit={p=>setDialog({type:'entity',kind:'project',entity:p})} onRemove={p=>askRemove('project',p)} detail={p=>state.chats.filter(c=>c.projectId===p.id).length+' chats'} action="Open project" onOpen={p=>startChat(p.id)} onExtra={p=>openSearchResult('project',p)} extraLabel="Project overview"/></>}
         {view==='gems'&&<><PageTitle Icon={Gem} label="REUSABLE ASSISTANTS" title="Gems" description="Save specialized instructions, references, and model settings. Call any Gem from any chat." action="New Gem" onAction={()=>setDialog({type:'entity',kind:'gem'})}/>
-          <CardGrid items={state.gems} Icon={Gem} emptyTitle="Create your first Gem" emptyDescription="Give it a role and instructions, then bring it into a conversation." onCreate={()=>setDialog({type:'entity',kind:'gem'})} onEdit={g=>setDialog({type:'entity',kind:'gem',entity:g})} onRemove={g=>askRemove('gem',g)} detail={g=>'v'+g.version+' · '+(getConnection(state,g.choice?.connectionId)?.name??'Inherits model')} action="Use in chat" onOpen={g=>pickGem({mode:'once',ids:[g.id]})}/></>}
+          <button className="button secondary" onClick={()=>setDialog({type:'assistant-import',kind:'gem'})}>Import Gem</button>
+          <CardGrid items={state.gems} Icon={Gem} emptyTitle="Create your first Gem" emptyDescription="Give it a role and instructions, then bring it into a conversation." onCreate={()=>setDialog({type:'entity',kind:'gem'})} onEdit={g=>setDialog({type:'entity',kind:'gem',entity:g})} onRemove={g=>askRemove('gem',g)} detail={g=>'v'+g.version+' · '+(getConnection(state,g.choice?.connectionId)?.name??'Inherits model')} action="Use in chat" onOpen={g=>pickGem({mode:'once',ids:[g.id]})}
+            onExtra={entity=>setDialog({type:'revisions',kind:'gem',entity})} extraLabel="Gem versions" /></>}
         {view==='workflows'&&<>
           <PageTitle Icon={GitBranch} title="Workflows" description="Build reusable runs from prompts, Gems, files, and control steps." action="New workflow" onAction={()=>setDialog({type:'workflow'})}/>
           {project&&<button className="button secondary" onClick={()=>setDialog({type:'project-file',project})}>Add project file</button>}
           <CardGrid items={state.workflows??[]} Icon={GitBranch} emptyTitle="Create a workflow" emptyDescription="Start with a prompt and add steps as needed." onCreate={()=>setDialog({type:'workflow'})} onEdit={entity=>setDialog({type:'workflow',entity})} onRemove={entity=>askRemove('workflow',entity)}
-            detail={w=>'v'+w.version+(w.scheduleMinutes?' · Every '+w.scheduleMinutes+' min':' · Manual or API')} action="Run workflow" onOpen={w=>setDialog({type:'workflow-run',entity:w})}/></>}
+            detail={w=>'v'+w.version+(w.scheduleMinutes?' · Every '+w.scheduleMinutes+' min':' · Manual or API')} action="Run workflow" onOpen={w=>setDialog({type:'workflow-run',entity:w})}
+            onExtra={entity=>setDialog({type:'revisions',kind:'workflow',entity})} extraLabel="Workflow versions" /></>}
         {view==='shared'&&<Collaboration/>}
         {view==='studio'&&<Studio state={state} user={user} vaultAvailable={session.vaultAvailable} onArtifact={(name,text)=>setDialog({type:'artifact',entity:{name,text}})}/>}
         {view==='integrations'&&<Integrations configured={integrations.notebooklm?.configured} onTask={notebook=>setDialog({type:'task',notebook})}/>}
-        {view==='jobs'&&<Jobs key={selectedRun??'job-list'} initialRun={selectedRun} onCreate={()=>setDialog({type:'task'})} onArtifact={(name,text,runId)=>setDialog({type:'artifact',entity:{name,text,origin:{kind:'run',id:runId}}})}/>}
+        {view==='jobs'&&<Jobs onSkill={(run,output)=>setDialog({type:'resource',kind:'skill',seed:{name:run.definition.name.slice(0,80),description:'Draft from a completed run',projectId:run.definition.projectId,family:'general',text:('Describe how to reproduce this reviewed result. Replace this example with safe, reusable instructions.\n\nExample output:\n'+output.text).slice(0,40000),enabled:false}})} key={selectedRun??'job-list'} initialRun={selectedRun} onCreate={()=>setDialog({type:'task'})} onArtifact={(name,text,runId)=>setDialog({type:'artifact',entity:{name,text,origin:{kind:'run',id:runId}}})}/>}
         {view==='artifacts'&&<><PageTitle Icon={Pencil} title="Canvas" description="Edit a document or code draft, preview it, and export the file." action="New artifact" onAction={()=>setDialog({type:'artifact'})}/>
           <CardGrid items={state.artifacts??[]} Icon={Pencil} emptyTitle="Open a new canvas" emptyDescription="Start a document, table, or code draft." onCreate={()=>setDialog({type:'artifact'})} onEdit={entity=>setDialog({type:'artifact',entity})}
             onRemove={entity=>askRemove('artifact',entity)} detail={a=>a.kind} action="Share snapshot" onOpen={entity=>setDialog({type:'share-confirm',kind:'artifact',entity})}/></>}
@@ -609,11 +698,26 @@ function Workspace(){
           const kind=view==='skills'?'skill':'knowledge', title=kind==='skill'?'Skills':'Knowledge', Icon=kind==='skill'?Zap:BookOpen;
           const edit=entity=>setDialog({type:'resource',kind,entity});
           return <><PageTitle Icon={Icon} title={title} description={kind==='skill'?'Give the assistant reusable instructions for a task.':'Add references the assistant can retrieve for a task.'} action={kind==='skill'?'Add skill':'Add source'} onAction={()=>edit()}/>
-            <CardGrid items={state[view]??[]} Icon={Icon} emptyTitle={'Add '+(kind==='skill'?'a skill':'a source')} emptyDescription="Choose when it applies and which project can use it." onCreate={()=>edit()} onEdit={edit} onRemove={item=>askRemove(kind,item)} detail={item=>(item.enabled?'Enabled':'Disabled')+' · '+(state.projects.find(p=>p.id===item.projectId)?.name??'Workspace')}/></>;
+            {kind==='skill'&&<button className="button secondary" onClick={()=>setDialog({type:'assistant-import',kind})}>Import skill</button>}
+            <CardGrid items={state[view]??[]} Icon={Icon} emptyTitle={'Add '+(kind==='skill'?'a skill':'a source')} emptyDescription="Choose when it applies and which project can use it." onCreate={()=>edit()} onEdit={edit} onRemove={item=>askRemove(kind,item)} onExtra={kind==='skill'?entity=>setDialog({type:'revisions',kind,entity}):undefined} extraLabel="Skill versions" detail={item=>(item.enabled?'Enabled':'Disabled')+' · '+(state.projects.find(p=>p.id===item.projectId)?.name??'Workspace')}/></>;
         })()}
-        {view==='memory'&&<><PageTitle Icon={Brain} label="PERSONAL CONTEXT" title="Memory" description="Save preferences or facts to use in future conversations. You can turn memory off for individual projects or Gem runs." action="Add memory" onAction={()=>setDialog({type:'memory'})}/>
+        {view==='memory'&&<>
           <div className="inline-bar"><span><strong>Use account memory</strong><small>Include saved entries when allowed by the project and run.</small></span><label className="checkbox"><input type="checkbox" checked={state.settings.memoryEnabled} onChange={e=>{const enabled=e.target.checked;safe(()=>persist(s=>({...s,settings:{...s.settings,memoryEnabled:enabled}})));}}/>Enabled</label></div>
-          <CardGrid items={state.memory} Icon={Brain} emptyTitle="Memory is empty" emptyDescription="Add something you want your assistant to remember." onCreate={()=>setDialog({type:'memory'})} onEdit={m=>setDialog({type:'memory',entity:m})} onRemove={m=>askRemove('memory',m)} description={m=>m.text} detail={m=>m.projectId?(state.projects.find(project=>project.id===m.projectId)?.name??'Unavailable project'):'Personal'}/></>}
+          <MemoryManager state={state} onEdit={entity=>setDialog({type:'memory',entity})} onRemove={entity=>askRemove('memory',entity)} onOpen={openSearchResult}
+            onExport={entries=>download('kapron-memory.json',JSON.stringify({format:'kapron-memory-v1',entries}), 'application/json')}
+            onMerge={async (entries,text)=>{
+              const mergedId=id(), updated=now(), ids=new Set(entries.map(item=>item.id));
+              await persist(current=>{
+                const records=current.memory.filter(item=>ids.has(item.id));
+                if(records.length!==entries.length||records.some(item=>entries.find(entry=>entry.id===item.id)?.updated!==item.updated)||
+                  records.some(item=>(item.projectId??null)!==(records[0].projectId??null)))throw new Error('Memory changed. Select the entries again.');
+                const merged={id:mergedId,name:'Memory entry',text,projectId:records[0].projectId??null,pinned:records.some(item=>item.pinned),
+                  reason:'Merged manually',created:updated,updated,origins:records.flatMap(item=>item.origins??[]).slice(0,64),
+                  mergedFrom:[...new Set(records.flatMap(item=>[item.id,...(item.mergedFrom??[])]))].slice(0,128)};
+                return {...current,memory:[merged,...current.memory.filter(item=>!ids.has(item.id))]};
+              });
+            }}/>
+        </>}
       </section>}
     </main>
     {toast&&<div className="toast" role="status">{toast}</div>}
@@ -633,7 +737,7 @@ function Workspace(){
       });
       setChatId(c.id);close();show('Voice transcript saved');
     }}/>}
-    {dialog?.type==='entity'&&<EntityEditor type={dialog.kind} entity={dialog.entity} state={state} onClose={close} onSave={v=>saveEntity(dialog.kind,dialog.entity,v)}/>}
+    {dialog?.type==='entity'&&<EntityEditor type={dialog.kind} entity={dialog.entity} seed={dialog.seed} defaultParent={dialog.parentId} state={state} onClose={close} onSave={v=>saveEntity(dialog.kind,dialog.entity,v)}/>}
     {dialog?.type==='connection'&&<ConnectionEditor entity={dialog.entity} user={user} workspaceOptions={{...state.settings.options,maxRunUsd:state.settings.routing?.maxRunUsd}} vaultAvailable={session.vaultAvailable} gatewayProvider={session.gatewayProvider} onClose={close} onSave={(v,k)=>saveConnection(dialog.entity,v,k)}/>}
     {dialog?.type==='gem-picker'&&<GemPicker state={state} initial={selection?.ids??[]} onPick={pickGem} onActive={i=>safe(()=>setActive(i))} onClose={close} onCreate={()=>setDialog({type:'entity',kind:'gem'})}/>}
     {dialog?.type==='review'&&<RunReview state={state} chat={dialog.chat} gems={dialog.gems} mode={dialog.mode} prompt={dialog.prompt} forcedChoice={dialog.forcedChoice} initialScope={dialog.initialScope} onClose={close} onRun={rows=>run(dialog,rows)}/>}
@@ -649,10 +753,15 @@ function Workspace(){
       const entry={id:id(),name,text,chatId:null,projectId:dialog.project.id,created:now()};
       await persist(s=>({...s,files:[...s.files,entry]}));close();show('Project file added');
     }}/>}
-    {dialog?.type==='resource'&&<ResourceEditor kind={dialog.kind} entity={dialog.entity} state={state} onClose={close} onSave={async values=>{
-      const field=dialog.kind==='skill'?'skills':'knowledge', entry={...values,id:dialog.entity?.id??id()};
-      await persist(s=>({...s,[field]:[entry,...(s[field]??[]).filter(x=>x.id!==entry.id)]}));close();show('Resource saved');
-    }}/>}
+    {dialog?.type==='resource'&&<ResourceEditor kind={dialog.kind} entity={dialog.entity} seed={dialog.seed} state={state} onClose={close}
+      onSave={values=>saveResource(dialog.kind,dialog.entity,values)}/>}
+    {dialog?.type==='assistant-import'&&<AssistantImport kind={dialog.kind} onClose={close}
+      onReview={seed=>setDialog({type:dialog.kind==='gem'?'entity':'resource',kind:dialog.kind,seed})}/>}
+    {dialog?.type==='revisions'&&<RevisionHistory kind={dialog.kind} entity={dialog.entity} onClose={close}
+      onRestore={values=>dialog.kind==='workflow'?saveWorkflow(dialog.entity,{...values,scheduleMinutes:dialog.entity.scheduleMinutes}):
+        dialog.kind==='gem'?saveEntity('gem',dialog.entity,values):saveResource('skill',dialog.entity,values)}
+      onClone={dialog.kind==='gem'?values=>setDialog({type:'entity',kind:'gem',seed:{...values,name:('Copy of '+values.name).slice(0,80)}}):undefined}
+      onExport={dialog.kind==='workflow'?undefined:values=>safe(()=>download('kapron-'+dialog.kind+'.json',JSON.stringify(exportAssistantPackage(dialog.kind,values)), 'application/json'))}/>}
     {dialog?.type==='branch'&&<BranchEditor message={dialog.message} onClose={close} onCreate={text=>branchFrom(dialog.message.id,text)}/>}
     {dialog?.type==='branch-compare'&&<Modal title="Compare conversations" wide onClose={close}><div className="select-model">
       {[chat,dialog.branch].map((entry,index)=>{
@@ -671,10 +780,12 @@ function Workspace(){
       if(remove)await api('vault/beatapi-router',{method:'DELETE'});
       await persist(s=>({...s,settings:{...s.settings,routing}}));close();show('Routing settings saved');
     }}/>}
-    {dialog?.type==='memory'&&<MemoryEditor entity={dialog.entity} projects={state.projects} onClose={close} onSave={async (text,projectId)=>{
-      const existing=dialog.entity, m={...existing,id:existing?.id??id(),name:'Memory entry',text,projectId:projectId||null};
+    {dialog?.type==='memory'&&<MemoryEditor entity={dialog.entity} seed={dialog.seed} projects={state.projects} onClose={close} onSave={async (text,projectId,pinned,reason)=>{
+      const existing=dialog.entity, updated=now(), m={...existing,...dialog.seed,id:existing?.id??id(),name:'Memory entry',text,
+        projectId:projectId||null,pinned,reason,created:existing?.created??updated,updated};
       await persist(s=>{
         if(projectId&&!s.projects.some(project=>project.id===projectId))throw new Error('This project is unavailable.');
+        if(existing&&!s.memory.some(item=>item.id===existing.id&&item.updated===existing.updated))throw new Error('This memory changed. Reopen the current version.');
         return {...s,memory:existing?s.memory.map(x=>x.id===m.id?m:x):[m,...s.memory]};
       });close();show('Memory saved');
     }}/>}
@@ -684,9 +795,37 @@ function Workspace(){
     {dialog?.type==='chat-import'&&<ChatImport preview={document=>importChatBundle(document,latest.current.state)} onImport={importChats} onClose={()=>setDialog({type:'history'})}/>}
     {dialog?.type==='search'&&<WorkspaceSearch state={state} onOpen={openSearchResult} onClose={close}/>}
     {dialog?.type==='view-file'&&<Modal title={dialog.entity.name} wide onClose={close}><div className="modal-form">{/^https?:\/\//i.test(dialog.entity.url??'')&&<a href={dialog.entity.url} target="_blank" rel="noreferrer">Open reference</a>}<pre className="file-preview" dir="auto">{dialog.entity.text}</pre></div></Modal>}
-    {dialog?.type==='account'&&<Modal title="My workspace" eyebrow="KAPRON" onClose={close}><div className="modal-form"><p>{session.user.email||'Private workspace'}</p><p className="hint">Workspace records sync through the server. Device keys and drafts stay in this browser. You can install Kapron from your browser’s menu where supported.</p>{!session.user.local&&(session.authMode==='email'?<button className="button secondary" onClick={()=>safe(async()=>{await get('auth/logout',{method:'POST'});location.reload();})}>Sign out</button>:<a className="button secondary" href="/signout-with-chatgpt?returnTo=%2F" target="_top">Sign out</a>)}</div><ShareControls onError={error=>show(error.message)}/></Modal>}
+    {dialog?.type==='project-gems'&&<ProjectGems project={dialog.entity} gems={state.gems} onClose={close} onSave={async gemIds=>{
+      await persist(current=>{
+        const previous=current.projects.find(item=>item.id===dialog.entity.id);
+        if(!previous||previous.updated!==dialog.entity.updated||gemIds.some(id=>!current.gems.some(item=>item.id===id)))
+          throw new Error('Project or Gems changed. Reopen the project.');
+        return {...current,projects:current.projects.map(item=>item.id===previous.id?{...item,gemIds,updated:now()}:item)};
+      });
+      close();show('Project Gems saved');
+    }}/>}
+    {dialog?.type==='workspace-backup'&&<WorkspacePortability state={state} onClose={()=>setDialog({type:'account'})}
+      onExport={()=>download('kapron-workspace-backup.json',JSON.stringify(exportWorkspace(latest.current.state)),'application/json')}
+      onRestore={async (backup,options)=>{await persist(current=>restoreWorkspaceBackup(current,backup,options));close();show('Workspace backup restored');}}/>}
+    {dialog?.type==='account'&&<Modal title="My workspace" eyebrow="KAPRON" onClose={close}><div className="modal-form"><p>{session.user.email||'Private workspace'}</p><p className="hint">Workspace records sync through the server. Device keys and drafts stay in this browser. You can install Kapron from your browser’s menu where supported.</p><button className="button secondary" onClick={()=>setDialog({type:'workspace-backup'})}>Workspace backup</button>{!session.user.local&&(session.authMode==='email'?<button className="button secondary" onClick={()=>safe(async()=>{await get('auth/logout',{method:'POST'});location.reload();})}>Sign out</button>:<a className="button secondary" href="/signout-with-chatgpt?returnTo=%2F" target="_top">Sign out</a>)}</div><ShareControls onError={error=>show(error.message)}/></Modal>}
   </div>;
 }
+function ProjectGems({project,gems,onClose,onSave}){
+  const [selected,setSelected]=useState(project.gemIds??[]),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  return <Modal title="Choose project Gems" onClose={onClose}>
+    <form className="modal-form" onSubmit={async event=>{
+      event.preventDefault();setBusy(true);
+      try{await onSave(selected);}catch(error){setError(error.message);setBusy(false);}
+    }}>
+      {!gems.length&&<p className="hint">Create a Gem to add it to this project.</p>}
+      {gems.map(item=><label key={item.id} className="checkbox"><input type="checkbox" checked={selected.includes(item.id)}
+        onChange={event=>setSelected(event.target.checked?[...selected,item.id]:selected.filter(id=>id!==item.id))}/>{item.name}</label>)}
+      {error&&<p className="form-error" role="alert">{error}</p>}
+      <div className="modal-actions"><button className="button primary" disabled={busy}>Save project Gems</button></div>
+    </form>
+  </Modal>;
+}
+
 function ShareDialog({kind,onShare,onClose}){
   const [days,setDays]=useState(7),[download,setDownload]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
   return <Modal title="Create a read-only share" onClose={onClose}><form className="modal-form" onSubmit={async event=>{
@@ -744,13 +883,13 @@ function RunDetails({message:m}){
     {m.routing&&<><dt>Routing</dt><dd>{m.routing.engine} · {m.routing.family}{m.routing.profile==='abliterated'&&' · Abliterated (likely false refusal)'}{m.routing.reason&&<small>{m.routing.reason}</small>}</dd>
       <dt>Skills</dt><dd>{m.routing.skills.join(', ')||'None'}</dd><dt>Knowledge</dt><dd>{m.routing.knowledge.join(', ')||'None'}</dd></>}
     {m.mode==='collaborate'&&<><dt>Collaboration</dt><dd>May include earlier successful Gem replies.</dd></>}
-    {Object.entries(m.options??{}).map(([k,v])=><div key={k}><dt>{{maxOutput:'Output token limit',temperature:'Temperature',maxRunUsd:'Estimated spending limit (USD)',reasoningEffort:'Reasoning effort'}[k]??k}</dt><dd>{v}</dd></div>)}
+    {Object.entries(m.options??{}).map(([k,v])=><div key={k}><dt>{{maxOutput:'Output token limit',temperature:'Temperature',maxRunUsd:'Estimated spending limit (USD)',reasoningEffort:'Reasoning effort',responseFormat:'Response format'}[k]??k}</dt><dd>{v}</dd></div>)}
     </dl></div>;
 }
 function PageTitle({Icon,label,title,description,action,onAction}){return <div className="page-heading"><span className="page-icon"><Icon size={23}/></span><div><p className="eyebrow">{label}</p><h1>{title}</h1><p>{description}</p></div><button className="button primary" onClick={onAction}><Plus size={17}/>{action}</button></div>;}
-function CardGrid({items,Icon,emptyTitle,emptyDescription,onCreate,onEdit,onRemove,detail,description,action,onOpen}){
+function CardGrid({items,Icon,emptyTitle,emptyDescription,onCreate,onEdit,onRemove,detail,description,action,onOpen,onExtra,extraLabel}){
   if(!items.length)return <button className="empty-card" onClick={onCreate}><span className="page-icon"><Plus size={21}/></span><strong>{emptyTitle}</strong><small>{emptyDescription}</small><ArrowRight size={17}/></button>;
-  return <div className="card-grid">{items.map(item=><article className="workspace-card" key={item.id}><div className="card-head"><span className="mini-icon"><Icon size={19}/></span><span className="push"/><IconButton label={'Edit '+item.name} Icon={Pencil} onClick={()=>onEdit(item)}/><IconButton label={'Delete '+item.name} Icon={Trash2} onClick={()=>onRemove(item)}/></div><h2>{item.name}</h2><p>{description?.(item)||item.description||''}</p>{detail&&<small>{detail(item)}</small>}{onOpen&&<button className="card-link" onClick={()=>onOpen(item)}>{action}<ArrowRight size={16}/></button>}</article>)}</div>;
+  return <div className="card-grid">{items.map(item=><article className="workspace-card" key={item.id}><div className="card-head"><span className="mini-icon"><Icon size={19}/></span><span className="push"/><IconButton label={'Edit '+item.name} Icon={Pencil} onClick={()=>onEdit(item)}/><IconButton label={'Delete '+item.name} Icon={Trash2} onClick={()=>onRemove(item)}/></div><h2>{item.name}</h2><p>{description?.(item)||item.description||''}</p>{detail&&<small>{detail(item)}</small>}{onOpen&&<button className="card-link" onClick={()=>onOpen(item)}>{action}<ArrowRight size={16}/></button>}{onExtra&&<button className="card-link" onClick={()=>onExtra(item)}>{extraLabel}</button>}</article>)}</div>;
 }
 function Defaults({state,onClose,onSave}){
   const [choice,setChoice]=useState(state.settings.defaultChoice);
@@ -760,11 +899,14 @@ function Defaults({state,onClose,onSave}){
     {error&&<p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy||!choice}>Save default</button></div>
   </form></Modal>;
 }
-function MemoryEditor({entity,projects,onClose,onSave}){
-  const [value,setValue]=useState(entity?.text||''),[error,setError]=useState(''),[busy,setBusy]=useState(false);
-  const [projectId,setProjectId]=useState(entity?.projectId??'');
-  return <Modal title={entity?'Edit memory':'Add memory'} onClose={onClose}><form className="modal-form" onSubmit={async e=>{e.preventDefault();if(!value.trim())return;setBusy(true);try{await onSave(value.trim(),projectId);}catch(e){setError(e.message);setBusy(false);}}}>
+function MemoryEditor({entity,seed,projects,onClose,onSave}){
+  const [value,setValue]=useState(entity?.text??seed?.text??''),[error,setError]=useState(''),[busy,setBusy]=useState(false);
+  const [projectId,setProjectId]=useState(entity?.projectId??seed?.projectId??'');
+  const [pinned,setPinned]=useState(entity?.pinned===true),[reason,setReason]=useState(entity?.reason??(seed?'Saved from a chat reply':''));
+  return <Modal title={entity?'Edit memory':'Add memory'} onClose={onClose}><form className="modal-form" onSubmit={async e=>{e.preventDefault();if(!value.trim())return;setBusy(true);try{await onSave(value.trim(),projectId,pinned,reason.trim());}catch(e){setError(e.message);setBusy(false);}}}>
     <label>Memory scope<select value={projectId} onChange={event=>setProjectId(event.target.value)}><option value="">Personal</option>{projects.map(project=><option value={project.id} key={project.id}>{project.name}</option>)}</select></label>
+    <label>Reason<input maxLength={180} value={reason} onChange={event=>setReason(event.target.value)}/></label>
+    <label className="checkbox"><input type="checkbox" checked={pinned} onChange={event=>setPinned(event.target.checked)}/>Prioritize within the memory budget</label>
     <label>What should Kapron remember?<textarea autoFocus required rows={4} maxLength={2000} value={value} onChange={e=>setValue(e.target.value)} placeholder="e.g. Prefer concise answers and show sources for factual claims."/></label>
     {error&&<p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>Save memory</button></div>
   </form></Modal>;
@@ -773,7 +915,7 @@ function ConfirmRemove({kind,entity,onClose,onRemove}){
   const [busy,setBusy]=useState(false),[error,setError]=useState('');
   const label=entity.title||entity.name||kind;
   return <Modal title={'Remove '+(kind==='gem'?'Gem':kind)+'?'} eyebrow="WORKSPACE" onClose={onClose}><div className="modal-form">
-    <p>{kind==='project'?'Chats in '+label+' will be moved outside the project. Project-scoped memory will be deleted.':kind==='connection'?'Remove '+label+' and its saved key from this connection.':'Remove '+label+' from this workspace.'}</p>
+    <p>{kind==='project'?'Chats in '+label+' will be moved outside the project. Project-scoped memory and notebooks will be deleted.':kind==='connection'?'Remove '+label+' and its saved key from this connection.':'Remove '+label+' from this workspace.'}</p>
     {error&&<p className="form-error">{error}</p>}<div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy} onClick={async()=>{setBusy(true);try{await onRemove();}catch(e){setError(e.message);setBusy(false);}}}>Remove</button></div>
   </div></Modal>;
 }

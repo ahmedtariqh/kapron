@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.kapron/
+.env*
+!.env.example
+.dev.vars*
+.openai/local*
+*.sqlite*
+
+test-results/
+playwright-report/
+__pycache__/
+.venv/
+wrangler.jsonc
+
+.venv-notebook/

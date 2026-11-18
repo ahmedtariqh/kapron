@@ -1,5 +1,6 @@
 import {abliteratedEligible,chooseModel,makeDecision,parseDecision,requestDecision,routingCandidates,rulesDecision} from '../server/routing.js';
 import {assembleContext,getConnection} from '../server/state.js';
+import {estimateRun} from '../server/model-policy.js';
 import {get,getDeviceKey} from './api.js';
 
 export async function resolveRoute({state,chat,row,prompt,prior,user,options,signal}){
@@ -40,7 +41,8 @@ export async function resolveRoute({state,chat,row,prompt,prior,user,options,sig
       if(c.mode==='vault')return ready.has(c.id+':'+c.provider)?c:null;
       return c.provider==='custom'||await getDeviceKey(user,c.id).catch(()=>null)?c:null;
     }));
-    connection=chooseModel(eligible.filter(Boolean),selected.family,length,routeState.preference,checkProfile?decision.profile:undefined);
+    const permitted=eligible.filter(c=>c&&!estimateRun(c,c.model,context,options,{...state.settings.options,maxRunUsd:routeState.maxRunUsd}).error);
+    connection=chooseModel(permitted,selected.family,length,routeState.preference,checkProfile?decision.profile:undefined);
     if(!connection && state.connections.length===0)connection=getConnection(state,'demo');
   }
   if(!connection)throw new Error('No available connection fits this request. Check your keys and Auto routing settings.');

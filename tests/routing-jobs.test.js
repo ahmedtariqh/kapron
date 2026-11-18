@@ -8,7 +8,7 @@ import {parseDecision,routingCandidates,chooseModel} from '../server/routing.js'
 
 function fixture(overrides={}){
   const db=new DatabaseSync(':memory:');
-  for(const migration of ['0000_workspace','0001_execution']) db.exec(readFileSync('drizzle/'+migration+'.sql','utf8'));
+  for(const migration of ['0000_workspace','0001_execution','0002_model_quota']) db.exec(readFileSync('drizzle/'+migration+'.sql','utf8'));
   const env={KAPRON_TRUST_SITES_IDENTITY:'1',KAPRON_VAULT_KEY:Buffer.alloc(32,4).toString('base64'),...overrides,DB:{
     prepare(sql){return {bind(...args){return {
       async first(){return db.prepare(sql).get(...args);},
@@ -23,6 +23,67 @@ function fixture(overrides={}){
   return {db,request,tick:()=>worker.scheduled(null,env)};
 }
 const packet=(text)=>new Response('data: '+JSON.stringify({choices:[{delta:{content:text}}]})+'\n\ndata: [DONE]\n\n');
+
+test('daily model reservations atomically constrain concurrent calls per workspace',async()=>{
+  let calls=0;
+  const {db,request}=fixture({KAPRON_DAILY_MODEL_UNITS:'106',MODEL_FETCH:async()=>{calls++;return packet('fixture');}});
+  try{
+    const state=initial();
+    state.connections=[{id:'model1',provider:'openai',model:'fixture',mode:'vault'}];
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    await request('vault/model1',{method:'PUT',body:{provider:'openai',key:'fixture-key'}});
+    const body={connectionId:'model1',model:'fixture',messages:[{role:'user',text:'hello'}],instruction:'',options:{maxOutput:16}};
+    const replies=await Promise.all(Array.from({length:12},()=>request('runs',{method:'POST',body})));
+    assert.equal(replies.filter(reply=>reply.status===200).length,2);
+    assert.equal(replies.filter(reply=>reply.status===429).length,10);
+    await Promise.all(replies.map(reply=>reply.text()));
+    assert.equal(calls,2);
+    assert.equal((await (await request('model-quota')).json()).used,106);
+    assert.equal((await (await request('model-quota',{user:'bob'})).json()).used,0);
+  }finally{db.close();}
+});
+
+test('gateway metadata, spend preflight, usage, and integration completions share the vault boundary',async()=>{
+  let calls=0;
+  const {db,request}=fixture({KAPRON_GATEWAY_PROVIDER:'litellm',KAPRON_GATEWAY_URL:'https://fixture.gateway.example',
+    MODEL_FETCH:async req=>{
+      if(req.method==='GET')return Response.json({data:[{id:'test/text',model_info:{max_input_tokens:8000,supports_function_calling:true,input_cost_per_token:.00001,api_key:'fixture-secret'}}]});
+      calls++;
+      const body=await req.json();
+      assert.equal(body.model,'test/text');
+      assert.deepEqual(body.stream_options,{include_usage:true});
+      return new Response('data: '+JSON.stringify({model:'upstream/test',choices:[{delta:{content:'Fixture'},finish_reason:'length'}]})+'\n\ndata: '+JSON.stringify({choices:[],usage:{prompt_tokens:12,completion_tokens:3,total_tokens:15,cost:.00013}})+'\n\ndata: [DONE]\n\n');
+    }});
+  try{
+    const state=initial();
+    state.settings.routing={maxRunUsd:.001};
+    state.connections=[{id:'gateway',model:'test/text',provider:'litellm',mode:'vault',capability:{inputPrice:10,outputPrice:20,reportUsage:true}}];
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    await request('vault/gateway',{method:'PUT',body:{provider:'litellm',key:'virtual-fixture-key'}});
+    const catalog=await (await request('gateway-models',{method:'POST',body:{provider:'litellm',connectionId:'gateway',details:true}})).json();
+    assert.deepEqual(catalog.catalog,[{id:'test/text',contextTokens:8000,tools:true,inputPrice:10}]);
+    const run={connectionId:'gateway',model:'test/text',messages:[{role:'user',text:'hello'}],instruction:'',options:{maxOutput:2048,reportUsage:true}};
+    assert.equal((await request('runs',{method:'POST',body:run})).status,422);
+    assert.equal(calls,0);
+    run.options.maxOutput=16;
+    const stream=await request('runs',{method:'POST',body:run});
+    assert.match(await stream.text(),/"total":15,"costUsd":0.00013.*"upstreamModel":"upstream\/test"/);
+    const issued=await (await request('access-keys',{method:'POST'})).json();
+    const headers={authorization:'Bearer '+issued.value};
+    const models=await (await request('v1/models',{user:null,headers})).json();
+    assert.deepEqual(models.data.map(model=>model.id),['gateway']);
+    const input={model:'gateway',messages:[{role:'user',content:'hello'}],max_completion_tokens:16};
+    const complete=await (await request('v1/chat/completions',{user:null,headers,method:'POST',body:input})).json();
+    assert.equal(complete.choices[0].message.content,'Fixture');
+    assert.equal(complete.choices[0].finish_reason,'length');
+    assert.equal(complete.usage.total_tokens,15);
+    const formatted=await request('v1/chat/completions',{user:null,headers,method:'POST',body:{...input,stream:true,stream_options:{include_usage:true}}});
+    assert.match(await formatted.text(),/"finish_reason":"length"[\s\S]*"total_tokens":15[\s\S]*\[DONE\]/);
+    assert.equal((await request('v1/chat/completions',{user:null,headers,method:'POST',body:{...input,model:'test/text'}})).status,404);
+    assert.equal((await request('v1/models',{user:null})).status,401);
+    assert.equal(calls,3);
+  }finally{db.close();}
+});
 
 for(const provider of ['litellm','omniroute'])test(provider+' gateway serves catalog, chat and jobs under the same vault boundary',async()=>{
   const hits=[];
@@ -135,12 +196,31 @@ test('immutable share snapshots expose content only while valid and revocation i
     state.artifacts.push({id:'artifact',name:'Document',text:'first revision'});
     await request('workspace',{method:'PUT',body:{state,revision:0}});
     const {id}=await (await request('shares',{method:'POST',body:{kind:'artifact',id:'artifact'}})).json();
+    assert.equal((await request('public-share/'+id+'/download',{user:null})).status,403);
     state.artifacts[0].text='second revision';
     await request('workspace',{method:'PUT',body:{state,revision:1}});
     await request('shares/'+id,{user:'bob',method:'DELETE'});
     assert.deepEqual(await (await request('public-share/'+id,{user:null})).json(),{title:'Document',text:'first revision'});
     await request('shares/'+id,{method:'DELETE'});
     assert.equal((await request('public-share/'+id,{user:null})).status,404);
+  }finally{db.close();}
+});
+
+test('snapshot exports obey the chosen expiry and download policy',async()=>{
+  const {db,request}=fixture();
+  try{
+    const state=initial();
+    state.chats.push({id:'safe-chat',title:'Shared chat',messages:[{id:'user-turn',role:'user',text:'Fixture content'}]});
+    assert.equal((await request('workspace',{method:'PUT',body:{state,revision:0}})).status,200);
+    assert.equal((await request('shares',{method:'POST',body:{kind:'chat',id:'safe-chat',days:31,download:true}})).status,400);
+    const {id,expires}=await (await request('shares',{method:'POST',body:{kind:'chat',id:'safe-chat',days:1,download:true}})).json();
+    assert.ok(expires>Date.now()+86_390_000&&expires<=Date.now()+86_400_000);
+    const response=await request('public-share/'+id+'/download',{user:null});
+    assert.equal(response.status,200);
+    assert.match(response.headers.get('content-disposition'),/^attachment;/);
+    assert.match(await response.text(),/Fixture content/);
+    db.prepare('UPDATE kapron_share SET expires=0 WHERE id=?').run(id);
+    assert.equal((await request('public-share/'+id+'/download',{user:null})).status,404);
   }finally{db.close();}
 });
 

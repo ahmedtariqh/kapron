@@ -1,4 +1,5 @@
 import {providerRequest,sse,extractText,providerError} from '../server/providers.js';
+import {reportedUsage} from '../server/model-policy.js';
 
 export async function api(path,{method='GET',body,signal}={}) {
   let response;
@@ -35,7 +36,7 @@ export const getDeviceKey=(user,id)=>deviceOperation(user,id,'get');
 export const saveDeviceKey=(user,id,value)=>deviceOperation(user,id,'put',value);
 export const removeDeviceKey=(user,id)=>deviceOperation(user,id,'delete');
 
-export async function streamRun({connection,model,context,options,user,signal,onDelta}){
+export async function streamRun({connection,model,context,options,user,signal,onDelta,onMetadata}){
   const input={connectionId:connection.id,model,...context,options};
   let response, direct=false, key;
   if(connection.mode==='device'){
@@ -51,10 +52,14 @@ export async function streamRun({connection,model,context,options,user,signal,on
   } else {
     response=await api('runs',{method:'POST',body:{...input,...(key?{deviceKey:key}:{})},signal});
   }
-  let text='',done=false;
+  let text='',done=false,usage,upstreamModel;
   for await(const event of sse(response)){
     if(event.error) throw new Error(typeof event.error==='string'?event.error:'The provider ended the stream with an error.');
     if(event.done) done=true;
+    const observed=direct?reportedUsage(connection.provider,event):event.usage;
+    if(observed)usage={...usage,...observed};
+    const identity=direct?(event.model??event.modelVersion):event.upstreamModel;
+    if(typeof identity==='string'&&/^[\w.:/\-]{1,160}$/.test(identity))upstreamModel=identity;
     const part=direct?extractText(connection.provider,event):event.delta;
     if(typeof part!=='string' || !part)continue;
     text+=part;
@@ -63,5 +68,6 @@ export async function streamRun({connection,model,context,options,user,signal,on
   }
   if(!direct&&!done)throw new Error('The reply stream disconnected before completion.');
   if(!text)throw new Error('The provider returned no visible text.');
+  onMetadata?.({usage,upstreamModel});
   return text;
 }

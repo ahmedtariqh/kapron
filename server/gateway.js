@@ -1,4 +1,5 @@
 import {isGateway, modelIdPattern} from './providers.js';
+import {catalogModel} from './model-policy.js';
 
 // Gateway destinations come from deployment configuration only.
 export function gatewayConfig(env) {
@@ -13,11 +14,11 @@ export function gatewayConfig(env) {
   return {provider, endpoint: url.pathname === '/' ? base + '/v1' : base};
 }
 
-export async function gatewayModels(config, key, fetcher = fetch, signal) {
+export async function gatewayModels(config, key, fetcher = fetch, signal, details = false) {
   const abort = AbortSignal.any([AbortSignal.timeout(10000), ...(signal ? [signal] : [])]);
   const response = await fetcher(new Request(config.endpoint + '/models', {
-    headers: {authorization: 'Bearer ' + key, accept: 'application/json'},
-    redirect: 'error', signal: abort
+    headers: {...(key?{authorization:'Bearer '+key}:{}),accept:'application/json'},
+    credentials:'omit',redirect:'error',signal:abort
   }));
   if (!response.ok || !response.body) {
     await response.body?.cancel();
@@ -37,8 +38,12 @@ export async function gatewayModels(config, key, fetcher = fetch, signal) {
     }
     const {data} = JSON.parse(text + decoder.decode());
     if (!Array.isArray(data)) throw new Error('Gateway model catalog is invalid.');
-    const models = data.map(model => model?.id).filter(id => typeof id === 'string' && modelIdPattern.test(id));
-    return {models: [...new Set(models)].sort().slice(0, 250)};
+    const eligible = new Map();
+    for (const model of data) {
+      if (typeof model?.id === 'string' && modelIdPattern.test(model.id) && !eligible.has(model.id)) eligible.set(model.id,model);
+    }
+    const models = [...eligible.keys()].sort().slice(0,250);
+    return {models,...(details?{catalog:models.map(id=>catalogModel(eligible.get(id)))}:{})};
   } finally {
     await reader.cancel().catch(() => {});
     reader.releaseLock();

@@ -83,7 +83,7 @@ export function WorkflowEditor({entity,state,onClose,onSave,task=false,notebook=
       <label>Project<select value={values.projectId??''} onChange={e=>patch('projectId',e.target.value)}><option value="">No project</option>{state.projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
       <div className="select-model"><label>Default connection<select value={values.connectionId} onChange={e=>patch('connectionId',e.target.value)}><option value="auto">Auto · vault connections</option><option value="demo">Kapron Demo</option>{state.connections.filter(c=>c.mode==='vault').map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
         <label>Model conflicts<select value={values.policy} onChange={e=>patch('policy',e.target.value)}><option value="fixed">Use this workflow connection</option><option value="prefer-gem">Prefer Gem, then project</option><option value="prefer-project">Prefer project, then Gem</option></select></label></div>
-      <div className="scope-grid">{[['useMemory','Include personal memory'],['cloudRouting','Allow Jev to classify step prompts'],['files','Include project files']].map(([key,label])=>
+      <div className="scope-grid">{[['useMemory','Include scoped memory'],['cloudRouting','Allow Jev to classify step prompts'],['files','Include project files']].map(([key,label])=>
         <label className="checkbox" key={key}><input type="checkbox" checked={values[key]} onChange={e=>patch(key,e.target.checked)}/>{label}</label>)}</div>
       {values.cloudRouting&&<label className="checkbox"><input type="checkbox" checked={values.abliterated===true} onChange={e=>patch('abliterated',e.target.checked)}/>Allow Auto to select a vault Abliterated connection</label>}
       {!task&&<label>Run every (minutes)<input type="number" min="5" max="10080" value={values.scheduleMinutes||''} onChange={e=>patch('scheduleMinutes',e.target.value)} placeholder="Manual or API only"/></label>}
@@ -97,8 +97,8 @@ export function WorkflowEditor({entity,state,onClose,onSave,task=false,notebook=
   </Modal>;
 }
 
-export function Jobs({onCreate,onArtifact}){
-  const [runs,setRuns]=useState([]),[error,setError]=useState(''),[selected,setSelected]=useState(null);
+export function Jobs({onCreate,onArtifact,initialRun=null}){
+  const [runs,setRuns]=useState([]),[error,setError]=useState(''),[selected,setSelected]=useState(initialRun);
   useEffect(()=>{
     const controller=new AbortController();
     async function poll(){
@@ -125,7 +125,8 @@ export function Jobs({onCreate,onArtifact}){
         {['queued','running','paused','blocked'].includes(run.status)&&<button className="button secondary" onClick={()=>action('cancel')}>Cancel run</button>}
       </div>
       {run.outputs.map((output,i)=><details className="advanced run-output" key={i} open={!!output.error}><summary>{output.label||'Step'} · {output.model||'Blocked'}</summary>{output.error?<p className="form-error">{output.error}</p>:<>
-        <pre>{output.text}</pre><button className="button secondary" onClick={()=>onArtifact(output.label||run.definition.name,output.text)}><FileText size={15}/>Open in Canvas</button></>}</details>)}
+        {output.usage&&<p className="hint">{output.usage.total!=null?output.usage.total+' tokens reported':'Token count unavailable'}{output.usage.costUsd!=null?' · USD '+output.usage.costUsd:''}</p>}
+        <pre>{output.text}</pre><button className="button secondary" onClick={()=>onArtifact(output.label||run.definition.name,output.text,run.id)}><FileText size={15}/>Open in Canvas</button></>}</details>)}
     </section>}
   </>;
 }

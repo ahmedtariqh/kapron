@@ -1,9 +1,12 @@
 import {useEffect,useRef,useState} from 'react';
 import {ArrowRight,Check,Gem,GitBranch,KeyRound,Layers3,MessageSquare,Settings2,X} from 'lucide-react';
 import {autoConnection,taskFamilies} from '../server/routing.js';
-import {providers,isGateway} from '../server/providers.js';
-import {get} from './api.js';
-import {defaultContext,demoConnection,getConnection,modelOptions,sameChoice} from '../server/state.js';
+import {providers,isGateway,customBase,providerRequest,sse,extractText} from '../server/providers.js';
+import {gatewayModels} from '../server/gateway.js';
+import {estimateRun} from '../server/model-policy.js';
+import {normalizeLabels} from './chat-library.js';
+import {get,getDeviceKey} from './api.js';
+import {assembleContext,defaultContext,demoConnection,getConnection,historyBudget,memoryContext,modelOptions,sameChoice} from '../server/state.js';
 
 export function Modal({title,eyebrow,children,onClose,wide=false}){
   const ref=useRef(null);
@@ -33,18 +36,27 @@ export function EntityEditor({type,entity,state,onSave,onClose}){
   const [instructions,setInstructions]=useState(entity?.instructions||'');
   const [knowledge,setKnowledge]=useState(entity?.knowledge||'');
   const [choice,setChoice]=useState(entity?.choice??null);
-  const [memory,setMemory]=useState(entity?.memoryEnabled!==false);
+  const [memoryMode,setMemoryMode]=useState(entity?.memoryMode??(entity?.memoryEnabled===false?'disabled':'personal'));
   const [projectId,setProjectId]=useState(entity?.projectId??'');
+  const [folder,setFolder]=useState(entity?.folder??'');
+  const [labels,setLabels]=useState(entity?.labels?.join(', ')??'');
+  const [historyChars,setHistoryChars]=useState(entity?.historyChars??'');
+  const [compactHistory,setCompactHistory]=useState(entity?.compactHistory===true);
+  const [pinnedFacts,setPinnedFacts]=useState(entity?.pinnedFacts??'');
   const [temperature,setTemp]=useState(entity?.options?.temperature??'');
   const [maxOutput,setMax]=useState(entity?.options?.maxOutput??'');
+  const [maxRunUsd,setMaxRunUsd]=useState(entity?.options?.maxRunUsd??'');
+  const [reasoningEffort,setReasoningEffort]=useState(entity?.options?.reasoningEffort??'');
   const [busy,setBusy]=useState(false),[error,setError]=useState('');
   const chat=type==='chat', project=type==='project',gem=type==='gem';
   const label=project?'project':gem?'Gem':'chat';
   const submit=async e=>{
     e.preventDefault();if(!name.trim())return;setBusy(true);setError('');
     try{
-      const options={...(temperature!==''?{temperature:Number(temperature)}:{}),...(maxOutput!==''?{maxOutput:Number(maxOutput)}:{})};
-      await onSave(chat?{title:name.trim(),projectId:projectId||null,choice,options}:project?{name:name.trim(),description,instructions,choice,memoryEnabled:memory,options}:{name:name.trim(),description,instructions,knowledge,choice,options});
+      const options={...(temperature!==''?{temperature:Number(temperature)}:{}),...(maxOutput!==''?{maxOutput:Number(maxOutput)}:{}),
+        ...(maxRunUsd!==''?{maxRunUsd:Number(maxRunUsd)}:{}),...(reasoningEffort?{reasoningEffort}:{})};
+      await onSave(chat?{title:name.trim(),projectId:projectId||null,choice,options,folder:folder.trim(),labels:normalizeLabels(labels.split(',')),
+        historyChars:historyChars===''?undefined:Number(historyChars),compactHistory,pinnedFacts:pinnedFacts.trim()}:project?{name:name.trim(),description,instructions,choice,memoryMode,memoryEnabled:memoryMode==='personal',options}:{name:name.trim(),description,instructions,knowledge,choice,options});
     }catch(e){setError(e.message);setBusy(false);}
   };
   return <Modal title={(entity?'Edit ':'New ')+label} eyebrow={project?'WORKSPACE':gem?'REUSABLE ASSISTANT':'CONVERSATION'} onClose={onClose}>
@@ -54,19 +66,27 @@ export function EntityEditor({type,entity,state,onSave,onClose}){
       {!chat&&<label>Instructions<textarea rows={3} maxLength={8000} value={instructions} onChange={e=>setInstructions(e.target.value)} placeholder={gem?'Give this Gem a role, style, and constraints.':'Instructions shared by chats in this project.'}/></label>}
       {gem&&<label>Reference material<textarea rows={3} maxLength={10000} value={knowledge} onChange={e=>setKnowledge(e.target.value)} placeholder="Optional notes to bring to any chat."/></label>}
       {chat&&<label>Project<select value={projectId} onChange={e=>setProjectId(e.target.value)}><option value="">No project</option>{state.projects.map(p=><option value={p.id} key={p.id}>{p.name}</option>)}</select></label>}
+      {chat&&<div className="select-model"><label>Folder<input value={folder} maxLength={80} onChange={e=>setFolder(e.target.value)}/></label><label>Labels<input value={labels} maxLength={400} placeholder="Separate labels with commas" onChange={e=>setLabels(e.target.value)}/></label></div>}
+      {chat&&<details className="advanced"><summary>Conversation context</summary>
+        <label>History character budget<input type="number" min="2000" max="150000" step="1" placeholder="150000" value={historyChars} onChange={e=>setHistoryChars(e.target.value)}/></label>
+        <label className="checkbox"><input type="checkbox" checked={compactHistory} onChange={e=>setCompactHistory(e.target.checked)}/>Include short excerpts from older turns when space allows</label>
+        <label>Pinned facts<textarea value={pinnedFacts} maxLength={4000} rows={3} onChange={e=>setPinnedFacts(e.target.value)}/><small>Included when you send conversation history.</small></label>
+      </details>}
       <div className="form-divider"/><SelectModel state={state} value={choice} onChange={setChoice}/>
       <details className="advanced"><summary>Generation settings</summary><div className="select-model">
         <label>Temperature<input type="number" min="0" max="2" step=".1" placeholder="Inherit" value={temperature} onChange={e=>setTemp(e.target.value)}/></label>
         <label>Output token limit<input type="number" min="16" max="32768" step="1" placeholder="Inherit" value={maxOutput} onChange={e=>setMax(e.target.value)}/></label>
+        <label>Maximum estimated USD per call<input type="number" min="0" max="1000" step="0.000001" placeholder="Inherit" value={maxRunUsd} onChange={e=>setMaxRunUsd(e.target.value)}/></label>
+        <label>Reasoning effort<select value={reasoningEffort} onChange={e=>setReasoningEffort(e.target.value)}><option value="">Inherit</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select><small>Requires a model that accepts reasoning effort.</small></label>
       </div></details>
-      {project&&<label className="checkbox"><input type="checkbox" checked={memory} onChange={e=>setMemory(e.target.checked)}/>Use account memory in this project</label>}
+      {project&&<label>Project memory<select value={memoryMode} onChange={e=>setMemoryMode(e.target.value)}><option value="personal">Personal memory (account setting)</option><option value="project">Project-only memory</option><option value="disabled">Disabled</option></select></label>}
       {error&&<p className="form-error" role="alert">{error}</p>}
       <FormActions onClose={onClose} busy={busy}>{entity?'Save changes':'Create '+label}</FormActions>
     </form>
   </Modal>;
 }
 
-export function ConnectionEditor({entity,vaultAvailable,gatewayProvider,onSave,onClose}){
+export function ConnectionEditor({entity,user,workspaceOptions,vaultAvailable,gatewayProvider,onSave,onClose}){
   const preferred=entity?.provider||(vaultAvailable&&gatewayProvider)||'openai';
   const [provider,setProvider]=useState(preferred);
   const [name,setName]=useState(entity?.name||providers[preferred].name);
@@ -78,43 +98,72 @@ export function ConnectionEditor({entity,vaultAvailable,gatewayProvider,onSave,o
   const [routing,setRouting]=useState({enabled:true,specialties:[],quality:2,economy:2,contextChars:240000,...entity?.routing});
   const [busy,setBusy]=useState(false),[error,setError]=useState('');
   const [models,setModels]=useState(null),[loadingModels,setLoadingModels]=useState(false);
+  const [checking,setChecking]=useState(false),[checkResult,setCheckResult]=useState('');
+  const [catalog,setCatalog]=useState([]);
+  const [capability,setCapability]=useState(entity?.capability??{});
   const custom=provider==='custom';
   const gateway=isGateway(provider);
   const storage=gateway?'vault':custom?'device':mode;
   const endpointChanged=custom&&!!entity&&endpoint.trim()!==entity.endpoint;
+  async function directKey(){return key.trim()||(!endpointChanged&&entity?await getDeviceKey(user,entity.id):'');}
   async function discoverModels(){
     setError('');setLoadingModels(true);setModels(null);
     try{
-      const result=await get('gateway-models',{method:'POST',body:{provider,connectionId:entity?.id,key:key.trim()}});
-      setModels(result.models);
+      const result=custom?await gatewayModels({endpoint:customBase(endpoint)},await directKey(),fetch,undefined,true)
+        :await get('gateway-models',{method:'POST',body:{provider,connectionId:entity?.id,key:key.trim(),details:true}});
+      if(result.status)throw new Error('Model catalog returned HTTP '+result.status+'.');
+      setModels(result.models);setCatalog(result.catalog??[]);
     }catch(e){setError(e.message);}finally{setLoadingModels(false);}
+  }
+  async function testConnection(){
+    setCheckResult('');setError('');setChecking(true);
+    try{
+      const context={messages:[{role:'user',text:'Reply with OK.'}]};
+      const estimate=estimateRun({provider,model:model.trim(),capability},model.trim(),context,{maxOutput:16},workspaceOptions);
+      if(estimate.error)throw new Error(estimate.error);
+      const response=await fetch(providerRequest({provider,model:model.trim(),endpoint,key:await directKey(),
+        ...context,options:{maxOutput:estimate.maxOutput},signal:AbortSignal.timeout(10000)}));
+      if(!response.ok){await response.body?.cancel();throw new Error('Connection test returned HTTP '+response.status+'.');}
+      let received=false;
+      for await(const event of sse(response)){if(extractText(provider,event)){received=true;break;}}
+      if(!received)throw new Error('The model returned no text.');
+      setCheckResult('The model streamed a reply.');
+    }catch(failure){setError(failure.message);}finally{setChecking(false);}
   }
   async function submit(e){
     e.preventDefault();setError('');
     if(!/^[\w.:/\-]{1,160}$/.test(model.trim())){setError('Enter a valid provider model ID.');return;}
-    if(custom){
-      try{
-        const u=new URL(endpoint);
-        if(!['http:','https:'].includes(u.protocol)||u.username||u.password||u.search||u.hash||(u.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(u.hostname)))throw Error();
-      }catch{setError('Use an HTTPS base URL or a loopback HTTP URL.');return;}
-    }
+    if(custom)try{customBase(endpoint);}catch{setError('Use an HTTPS base URL or a loopback HTTP URL.');return;}
     const changesCredential=entity && (entity.mode!==storage||entity.provider!==provider);
     if(!custom&&!key.trim()&&(!entity||changesCredential)){setError('Enter an API key for this connection.');return;}
     setBusy(true);
-    try{await onSave({provider,name:name.trim(),model:model.trim(),endpoint:custom?endpoint.trim():undefined,mode:storage,routing,relay:!custom&&storage==='device'&&relay},key.trim());}
+    try{await onSave({provider,name:name.trim(),model:model.trim(),endpoint:custom?endpoint.trim():undefined,mode:storage,routing,capability,relay:!custom&&storage==='device'&&relay},key.trim());}
     catch(e){setError(e.message);setBusy(false);}
+  }
+  function selectModel(value){
+    setModel(value);
+    setCheckResult('');
+    const metadata=catalog.find(item=>item.id===value.trim());
+    if(value.trim()!==model.trim())setCapability(metadata??(value.trim()===entity?.model?entity.capability??{}:{}));
   }
   return <Modal title={entity?'Edit connection':'Add a connection'} eyebrow="MODEL PROVIDERS" onClose={onClose}>
     <form className="modal-form" onSubmit={submit}>
-      <label>Provider<select value={provider} disabled={!!entity||loadingModels} onChange={e=>{const p=e.target.value;setProvider(p);setName(providers[p].name);setModel(providers[p].model);setModels(null);if(p==='custom'){setMode('device');setRelay(false);}}}>
+      <label>Provider<select value={provider} disabled={!!entity||loadingModels||checking} onChange={e=>{const p=e.target.value;setProvider(p);setName(providers[p].name);setModel(providers[p].model);setModels(null);setCatalog([]);setCapability({});setCheckResult('');if(p==='custom'){setMode('device');setRelay(false);}}}>
         {Object.entries(providers).filter(([p])=>p!=='demo'&&(!isGateway(p)||p===entity?.provider||(vaultAvailable&&p===gatewayProvider))).map(([p,v])=><option key={p} value={p}>{v.name}</option>)}
       </select></label>
       <label>Connection name<input required maxLength={80} value={name} onChange={e=>setName(e.target.value)}/></label>
-      {custom&&<label>API base URL<input type="url" required maxLength={300} value={endpoint} onChange={e=>setEndpoint(e.target.value)} placeholder="https://your-provider.example/v1"/><small>The endpoint must allow requests from this browser.</small></label>}
-      <label>Default model ID<input required maxLength={160} value={model} onChange={e=>setModel(e.target.value)} placeholder="Provider model ID"/></label>
-      {gateway&&<div className="flow-row"><button type="button" className="button secondary" onClick={discoverModels} disabled={loadingModels||(!entity&&!key.trim())||provider!==gatewayProvider}>{loadingModels?'Loading models…':'Load gateway models'}</button>
-        {models?.length>0&&<label>Discovered model<select value={models.includes(model)?model:''} onChange={e=>{if(e.target.value)setModel(e.target.value);}}><option value="">Select a model</option>{models.map(id=><option key={id}>{id}</option>)}</select></label>}
+      {custom&&<label>API base URL<input type="url" required maxLength={300} disabled={loadingModels||checking} value={endpoint} onChange={e=>{setEndpoint(e.target.value);setModels(null);setCatalog([]);setCapability({});setCheckResult('');}} placeholder="http://localhost:11434/v1"/><small>Use the OpenAI-compatible API base for Ollama, LM Studio or another server. The endpoint must allow requests from this browser.</small></label>}
+      <label>Default model ID<input required maxLength={160} value={model} onChange={e=>selectModel(e.target.value)} placeholder="Provider model ID"/></label>
+      {(gateway||custom)&&<div className="flow-row"><button type="button" className="button secondary" onClick={discoverModels} disabled={loadingModels||checking||(custom?!endpoint.trim():(!entity&&!key.trim())||provider!==gatewayProvider)}>{loadingModels?'Loading models…':custom?'Discover local models':'Load gateway models'}</button>
+        {custom&&<button type="button" className="button secondary" onClick={testConnection} disabled={checking||loadingModels||!model.trim()||!endpoint.trim()}>{checking?'Testing…':'Test with a short prompt'}</button>}
+        {models?.length>0&&<label>Discovered model<select value={models.includes(model)?model:''} onChange={e=>selectModel(e.target.value)}><option value="" disabled>Select a model</option>{models.map(id=><option key={id}>{id}</option>)}</select></label>}
         {models?.length===0&&<small>No models were returned for this key.</small>}</div>}
+      {checkResult&&<p role="status">{checkResult}</p>}
+      <details className="advanced"><summary>Model capabilities and pricing</summary>
+        <p className="hint">Input: {capability.input?.join(', ')||'Unknown'} · Output: {capability.output?.join(', ')||'Unknown'} · Tools: {capability.tools==null?'Unknown':capability.tools?'Supported':'Unavailable'} · Structured output: {capability.structured==null?'Unknown':capability.structured?'Supported':'Unavailable'}</p>
+        <div className="select-model">{[['contextTokens','Context tokens',1],['maxOutput','Maximum output tokens',1],['inputPrice','Input USD per million tokens',0.000001],['outputPrice','Output USD per million tokens',0.000001],['latencyMs','Reference latency (ms)',1]].map(([field,label,step])=><label key={field}>{label}<input type="number" min={field.endsWith('Price')?0:1} step={step} value={capability[field]??''} onChange={e=>setCapability({...capability,[field]:e.target.value===''?undefined:Number(e.target.value)})}/></label>)}</div>
+        {provider!=='custom'&&provider!=='gemini'&&<label className="checkbox"><input type="checkbox" checked={capability.reportUsage===true} onChange={e=>setCapability({...capability,reportUsage:e.target.checked})}/>Request streaming usage from this provider</label>}
+      </details>
       <label>Key storage<select value={storage} disabled={custom||gateway} onChange={e=>setMode(e.target.value)}><option value="device">On this device</option><option value="vault" disabled={!vaultAvailable}>Encrypted server vault{vaultAvailable?'':' · unavailable'}</option></select></label>
       <label>API key{custom?' (optional)':''}<input type="password" maxLength={4000} autoComplete="off" value={key} onChange={e=>setKey(e.target.value)} placeholder={entity&&!endpointChanged?'Leave blank to keep the current key':'Enter your provider key'}/></label>
       {!custom&&storage==='device'&&<label className="checkbox"><input type="checkbox" checked={relay} onChange={e=>setRelay(e.target.checked)}/>Allow one-request relay when sending a message <span className="sr-only">The server reads the key for that request.</span></label>}
@@ -147,14 +196,14 @@ export function GemPicker({state,initial=[],onPick,onActive,onCreate,onClose}){
   </Modal>;
 }
 
-const scopeLabels={history:'Recent chat history',project:'Project instructions',memory:'Personal memory',gem:'Gem instructions and references',files:'Attached and project files',skills:'Auto-select skills',knowledge:'Auto-select knowledge',routingCloud:'Allow Jev to classify this prompt',abliterated:'Allow Auto to select an Abliterated connection'};
-export function RunReview({state,chat,gems,mode,onRun,onClose}){
+const scopeLabels={history:'Recent chat history',project:'Project instructions',memory:'Scoped memory',gem:'Gem instructions and references',files:'Attached and project files',skills:'Auto-select skills',knowledge:'Auto-select knowledge',routingCloud:'Allow Jev to classify this prompt',abliterated:'Allow Auto to select an Abliterated connection'};
+export function RunReview({state,chat,gems,mode,prompt='',forcedChoice,initialScope,onRun,onClose}){
   const project=state.projects.find(x=>x.id===chat.projectId);
   const usableFiles=state.files.filter(x=>x.chatId===chat.id||(chat.projectId&&x.projectId===chat.projectId&&!x.chatId));
-  const available={history:chat.messages.length>0,project:!!project?.instructions,memory:state.settings.memoryEnabled&&project?.memoryEnabled!==false&&state.memory.length>0,files:usableFiles.length>0,skills:!!state.skills?.length,knowledge:!!state.knowledge?.length,routingCloud:!!state.settings.routing?.cloud,abliterated:state.connections.some(c=>c.routing?.profile==='abliterated'&&c.routing?.enabled!==false)};
+  const available={history:chat.messages.length>0||!!chat.pinnedFacts,project:!!project?.instructions,memory:memoryContext(state,chat.projectId).entries.length>0,files:usableFiles.length>0,skills:!!state.skills?.length,knowledge:!!state.knowledge?.length,routingCloud:!!state.settings.routing?.cloud,abliterated:state.connections.some(c=>c.routing?.profile==='abliterated'&&c.routing?.enabled!==false)};
   const [rows,setRows]=useState(()=>gems.map(g=>{
-    const candidates=modelOptions(state,chat,g);
-    return {gem:g,candidates,choice:candidates.length===1?candidates[0].choice:null,scope:{...defaultContext,files:usableFiles.length>0,routingCloud:true,abliterated:available.abliterated,...chat.contextPrefs?.[g?.id??'main']},remember:!!chat.contextPrefs?.[g?.id??'main']};
+    const candidates=forcedChoice?[{source:'Rerun choice',choice:forcedChoice}]:modelOptions(state,chat,g);
+    return {gem:g,candidates,choice:candidates.length===1?candidates[0].choice:null,scope:{...defaultContext,files:usableFiles.length>0,routingCloud:true,abliterated:available.abliterated,...chat.contextPrefs?.[g?.id??'main'],...initialScope},remember:!!chat.contextPrefs?.[g?.id??'main']};
   }));
   function update(i,patch){setRows(rows=>rows.map((r,j)=>i===j?{...r,...patch}:r));}
   const conflict=rows.some(r=>r.candidates.length>1);
@@ -164,6 +213,8 @@ export function RunReview({state,chat,gems,mode,onRun,onClose}){
       {mode==='collaborate'&&<p className="hint">Later Gems receive earlier replies as reference, including across providers.</p>}
       {rows.map((r,i)=>{
         const connection=getConnection(state,r.choice?.connectionId);
+        const context=assembleContext(state,chat,r.gem,r.scope,prompt);
+        const history=historyBudget(chat,prompt,r.scope.history,context.instruction);
         return <section className="review-card" key={r.gem?.id??'main'}>
           <h3>{r.gem?.name??'Chat assistant'}</h3>
           {r.candidates.length>1&&<div className="radio-list">{r.candidates.map(c=><label className="checkbox radio" key={c.source}><input type="radio" name={'choice'+i} checked={sameChoice(r.choice,c.choice)} onChange={()=>update(i,{choice:c.choice})}/><span>{c.source} · {getConnection(state,c.choice.connectionId)?.name}<small>{c.choice.model}</small></span></label>)}</div>}
@@ -173,6 +224,7 @@ export function RunReview({state,chat,gems,mode,onRun,onClose}){
             const enabled=k==='gem'?!!r.gem:k==='abliterated'?available[k]&&r.choice?.connectionId==='auto':available[k];
             return <label className={'checkbox'+(enabled?'':' muted')} key={k}><input type="checkbox" checked={enabled&&!!r.scope[k]} disabled={!enabled} onChange={e=>update(i,{scope:{...r.scope,[k]:e.target.checked}})}/>{label}</label>;
           })}</div>
+          {available.history&&<p className="hint" aria-live="polite">History preview · {history.messages.length-Number(history.compacted>0)} recent messages · {history.compacted} excerpts · {history.omitted} omitted{r.scope.history&&chat.pinnedFacts?' · pinned facts included':''}</p>}
           {!!usableFiles.length&&r.scope.files&&<p className="hint">Files: {usableFiles.map(x=>x.name).join(', ')}</p>}
           <label className="checkbox remember"><input type="checkbox" checked={r.remember} onChange={e=>update(i,{remember:e.target.checked})}/>Remember context choices in this chat</label>
         </section>;

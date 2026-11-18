@@ -55,6 +55,11 @@ export function ArtifactEditor({entity,onClose,onSave}){
     }}>
       <div className="select-model"><label>Title<input autoFocus required maxLength={120} value={doc.name} onChange={e=>update('name',e.target.value)}/></label>
       <label>Format<select value={doc.kind} onChange={e=>{setPreview(false);update('kind',e.target.value);}}><option value="markdown">Markdown</option><option value="csv">CSV table</option><option value="javascript">JavaScript</option><option value="html">HTML</option><option value="text">Plain text</option></select></label></div>
+      {!!doc.versions?.length&&<details className="advanced"><summary>Version history</summary>{doc.versions.map((version,index)=><div className="flow-row" key={version.id}>
+        <span>{version.name} · {new Date(version.updated).toLocaleString()}</span><button type="button" className="plain-button" onClick={()=>{
+          setDoc(current=>({...current,name:version.name,kind:version.kind,text:version.text}));setPreview(false);
+        }}>Restore version {index+1} to editor</button>
+      </div>)}</details>}
       <div className="flow-row"><button type="button" className="button secondary" onClick={()=>setPreview(v=>!v)}>{preview?'Back to editor':'Preview'}</button>
         <label>Export<select aria-label="Export file" value="" onChange={e=>{if(e.target.value)exportAs(e.target.value);}}><option value="">Choose format</option>
         <option value={{markdown:'md',csv:'csv',javascript:'js',html:'html',text:'txt'}[doc.kind]}>Source file</option>
@@ -77,6 +82,7 @@ export function SharedView({id}){
     return ()=>controller.abort();
   },[id]);
   return <main className="shared-view"><h1>{value?.title||'Shared from Kapron'}</h1>{error&&<p role="alert">{error}</p>}
+    {value?.download===true&&<a className="button secondary" href={'/api/public-share/'+encodeURIComponent(id)+'/download'}>Download snapshot</a>}
     {value?.messages?.map((m,i)=><article key={i}><h2>{m.role==='user'?'User':'Assistant'}</h2><pre>{m.text}</pre></article>)}
     {value?.text!=null&&<pre>{value.text}</pre>}</main>;
 }
@@ -91,7 +97,7 @@ export function ShareControls({onError}){
     setBusy(true);try{await fn();await refresh();}catch(error){onError(error);}finally{setBusy(false);}
   }
   return <div className="modal-form"><h3>Read-only shares</h3>
-    {shares.length?shares.map(s=><div className="inline-bar" key={s.id}><a href={'/?share='+s.id} target="_blank" rel="noreferrer">Open snapshot</a><button className="button secondary" disabled={busy} onClick={()=>operation(()=>get('shares/'+s.id,{method:'DELETE'}))}>Revoke</button></div>):<p className="hint">No active shares.</p>}
+    {shares.length?shares.map(s=><div className="inline-bar" key={s.id}><span><a href={'/?share='+s.id} target="_blank" rel="noreferrer">Open snapshot</a><small>Expires {new Date(s.expires).toLocaleString()}</small></span><button className="button secondary" disabled={busy} onClick={()=>operation(()=>get('shares/'+s.id,{method:'DELETE'}))}>Revoke</button></div>):<p className="hint">No active shares.</p>}
     <h3>Integration API keys</h3><p className="hint">A key can enqueue runs, spend through your approved connections, and read background run outputs. It expires after 30 days.</p>
     <button className="button secondary" disabled={busy} onClick={()=>operation(async()=>setNewKey((await get('access-keys',{method:'POST'})).value))}><Plus size={15}/>Create API key</button>
     {newKey&&<label>Copy this key now<input readOnly value={newKey} onFocus={e=>e.target.select()}/></label>}

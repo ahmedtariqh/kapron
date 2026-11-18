@@ -10,7 +10,7 @@ mkdirSync(localDir,{recursive:true,mode:0o700});
 const db=new DatabaseSync(join(localDir,'workspace.sqlite'));
 db.exec('PRAGMA journal_mode=WAL');
 db.exec('CREATE TABLE IF NOT EXISTS kapron_migration (id TEXT PRIMARY KEY)');
-for(const migration of ['0000_workspace','0001_execution']){
+for(const migration of ['0000_workspace','0001_execution','0002_model_quota']){
   const id=migration.slice(0,4);
   if(db.prepare('SELECT id FROM kapron_migration WHERE id=?').get(id))continue;
   db.exec('BEGIN');
@@ -25,6 +25,7 @@ if(!key){
 const env={LOCAL_USER:true,KAPRON_VAULT_KEY:key,
   KAPRON_GATEWAY_PROVIDER:process.env.KAPRON_GATEWAY_PROVIDER,
   KAPRON_GATEWAY_URL:process.env.KAPRON_GATEWAY_URL,
+  KAPRON_DAILY_MODEL_UNITS:process.env.KAPRON_DAILY_MODEL_UNITS,
   KAPRON_NOTEBOOKLM_URL:process.env.KAPRON_NOTEBOOKLM_URL,
   KAPRON_NOTEBOOKLM_TOKEN:process.env.KAPRON_NOTEBOOKLM_TOKEN,DB:{prepare(sql){return {bind(...values){return {
   async first(){return db.prepare(sql).get(...values)??null;},

@@ -77,6 +77,20 @@ test('project and Gem conflicts remain visible and context honors source choices
   assert.doesNotMatch(result.instruction,/private memory|wrong chat/);
   assert.deepEqual(result.messages,[{role:'user',text:'current prompt'}]);
 });
+test('project-only memory and legacy project settings isolate context',()=>{
+  const state=initial();
+  state.projects.push({id:'private',memoryMode:'project'},{id:'other',memoryMode:'project'},{id:'legacy',memoryEnabled:false});
+  state.memory.push({text:'Account detail'},{projectId:'private',text:'Private project detail'},{projectId:'other',text:'Other project detail'});
+  const context=(projectId,memory=true)=>assembleContext(state,{projectId,messages:[]},null,{memory},'test').instruction;
+  assert.equal(context('private'),'User supplied project memory:\nPrivate project detail');
+  assert.equal(context('other'),'User supplied project memory:\nOther project detail');
+  assert.equal(context('legacy'),'');
+  assert.equal(context(null),'User supplied personal memory:\nAccount detail');
+  assert.equal(context('private',false),'');
+  state.settings.memoryEnabled=false;
+  assert.equal(context(null),'');
+  assert.match(context('private'),/Private project detail/);
+});
 test('Gemini and OpenRouter request formats and provider stream parsing',async()=>{
   const input={model:'fixture-model',key:'synthetic',instruction:'Be concise',messages:[{role:'user',text:'First'},{role:'user',text:'Second'},{role:'assistant',text:'Reply'},{role:'user',text:'Third'}],options:{maxOutput:4096}};
   const gemini=providerRequest({...input,provider:'gemini'});

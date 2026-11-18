@@ -11,6 +11,15 @@ export const providers = {
 export const isGateway = provider => provider === 'litellm' || provider === 'omniroute';
 export const modelIdPattern = /^[\w.:/\-]{1,160}$/;
 
+export function customBase(endpoint){
+  const target=new URL(endpoint);
+  const local=['localhost','127.0.0.1','[::1]'].includes(target.hostname);
+  if((target.protocol!=='https:'&&!(local&&target.protocol==='http:'))||target.username||target.password||target.search||target.hash){
+    throw new Error('Use an HTTPS base URL or a loopback HTTP URL without credentials, query, or fragment.');
+  }
+  return target.href.replace(/\/+$/,'').replace(/\/chat\/completions$/,'');
+}
+
 export function providerRequest({ provider, model, endpoint, messages, instruction, key, options = {}, signal }) {
   if (typeof model !== 'string' || !modelIdPattern.test(model)) throw new Error('Enter a valid model ID.');
   const headers = { 'content-type': 'application/json', accept: 'text/event-stream' };
@@ -18,6 +27,7 @@ export function providerRequest({ provider, model, endpoint, messages, instructi
   if (Number.isFinite(options.temperature)) config.temperature = Math.min(2, Math.max(0, options.temperature));
   if (Number.isInteger(options.maxOutput)) config.maxOutput = Math.min(32768, Math.max(16, options.maxOutput));
   if (provider === 'gemini') {
+    if(options.reasoningEffort)throw new Error('This connection does not support the configured reasoning effort.');
     if (!/^[\w.\-]{1,160}$/.test(model)) throw new Error('Use the Gemini model ID without a path prefix.');
     headers['x-goog-api-key'] = key;
     const contents = [];
@@ -37,19 +47,14 @@ export function providerRequest({ provider, model, endpoint, messages, instructi
   if (provider === 'openai') url = 'https://api.openai.com/v1/chat/completions';
   else if (provider === 'openrouter') url = 'https://openrouter.ai/api/v1/chat/completions';
   else if (isGateway(provider)) url = new URL(endpoint).href + '/chat/completions';
-  else if (provider === 'custom') {
-    const target = new URL(endpoint);
-    const local = ['localhost','127.0.0.1','[::1]'].includes(target.hostname);
-    if ((target.protocol !== 'https:' && !(local && target.protocol === 'http:')) || target.username || target.password || target.search || target.hash) {
-      throw new Error('Use an HTTPS base URL or a loopback HTTP URL without credentials, query, or fragment.');
-    }
-    url = target.href.replace(/\/+$/, '');
-    if (!url.endsWith('/chat/completions')) url += '/chat/completions';
-  } else throw new Error('Choose a supported provider.');
+  else if (provider === 'custom') url=customBase(endpoint)+'/chat/completions';
+  else throw new Error('Choose a supported provider.');
   if (key) headers.authorization = 'Bearer ' + key;
   return new Request(url, {
     method:'POST', headers, signal, redirect:'error', credentials:'omit',
     body:JSON.stringify({ model, stream:true,
+      ...(options.reportUsage && provider!=='custom' ? {stream_options:{include_usage:true}} : {}),
+      ...(['low','medium','high'].includes(options.reasoningEffort)?{reasoning_effort:options.reasoningEffort}:{}),
       messages:[...(instruction ? [{role:'system',content:instruction}] : []),
         ...messages.map(x=>({role:x.role,content:x.text}))],
       ...(config.temperature != null ? {temperature:config.temperature} : {}),

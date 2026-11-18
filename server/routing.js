@@ -106,7 +106,9 @@ export function chooseModel(connections,family,contextLength,policy='balanced',p
     const r=c.routing??{}, specialty=r.specialties?.includes(family)?4:0;
     const quality=Number.isFinite(r.quality)?r.quality:2;
     const economy=Number.isFinite(r.economy)?r.economy:2;
-    return specialty+(policy==='economy'?economy*3+quality:policy==='quality'?quality*3+economy:quality*2+economy*2);
+    const latency=c.capability?.latencyMs;
+    const speed=Number.isFinite(latency)&&latency>0?Math.max(0,5-Math.log2(1+latency/100)):0;
+    return specialty+(policy==='economy'?economy*3+quality:policy==='quality'?quality*3+economy:policy==='latency'?speed*3+quality:quality*2+economy*2);
   };
   const ranked=eligible.sort((a,b)=>rank(b)-rank(a)||a.id.localeCompare(b.id));
   return (profile==='abliterated'?ranked.find(c=>c.routing?.profile==='abliterated'):undefined)

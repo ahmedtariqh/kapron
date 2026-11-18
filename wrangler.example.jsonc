@@ -8,6 +8,7 @@
     // Optional base gateway. Set the type to litellm or omniroute and use an HTTPS API base URL.
     // "KAPRON_GATEWAY_PROVIDER": "litellm",
     // "KAPRON_GATEWAY_URL": "https://your-gateway.example/v1",
+    // "KAPRON_DAILY_MODEL_UNITS": "1000000",
     "KAPRON_SUPABASE_URL": "https://YOUR-PROJECT.supabase.co"
   },
   "d1_databases": [{

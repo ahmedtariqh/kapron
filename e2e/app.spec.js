@@ -205,3 +205,223 @@ test('live voice widget negotiates a call, mutes, stops the mic, and saves compl
   await expect(page.getByRole('article',{name:'Your message'})).toContainText('Hello Kapron');
   await expect(page.getByRole('article',{name:'Assistant reply'})).toContainText('I can hear you.');
 });
+
+test('temporary chat leaves no workspace transcript or browser draft',async({page})=>{
+  const prompt='Temporary browser fixture';
+  await page.goto('/');
+  await page.getByRole('button',{name:'Temporary chat',exact:true}).click();
+  await page.getByRole('textbox',{name:'Message',exact:true}).fill(prompt);
+  await page.getByRole('button',{name:'Send message'}).click();
+  await expect(page.getByRole('article',{name:'Assistant reply'})).toContainText(prompt);
+  await expect(page.getByRole('button',{name:'Open reply in Canvas'})).toHaveCount(0);
+  await expect(page.getByRole('button',{name:'Attach files'})).toHaveCount(0);
+  await expect(page.getByRole('button',{name:'Send message'})).toBeVisible();
+  const response=await page.request.get('/api/workspace');
+  expect(JSON.stringify(await response.json())).not.toContain(prompt);
+  expect(await page.evaluate(text=>Object.values(localStorage).some(value=>value.includes(text)),prompt)).toBe(false);
+  await page.getByRole('button',{name:'New chat',exact:true}).click();
+  await expect(page.getByText(prompt,{exact:true})).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByText(prompt,{exact:true})).toHaveCount(0);
+});
+
+test('edited branch retains the original and supports comparison',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'Connections',exact:true}).click();
+  await page.getByRole('button',{name:'Change default',exact:true}).click();
+  await page.getByRole('dialog').getByRole('combobox',{name:'Connection'}).selectOption('demo');
+  await page.getByRole('button',{name:'Save default'}).click();
+  await page.getByRole('button',{name:'New chat',exact:true}).click();
+  const message=page.getByRole('textbox',{name:'Message',exact:true});
+  await message.fill('Original branch fixture');
+  await page.getByRole('button',{name:'Send message',exact:true}).click();
+  const review=page.getByRole('dialog').getByRole('button',{name:'Send message',exact:true});
+  if(await review.isVisible())await review.click();
+  await expect(page.getByRole('button',{name:'Branch from this message'})).toBeVisible();
+  await page.getByRole('button',{name:'Branch from this message'}).click();
+  await page.getByLabel('Edited message').fill('Edited branch fixture');
+  await page.getByRole('button',{name:'Create branch'}).click();
+  await expect(message).toHaveValue('Edited branch fixture');
+  await page.getByRole('button',{name:'Send message',exact:true}).click();
+  if(await review.isVisible())await review.click();
+  await expect(page.getByRole('button',{name:'Branch from this message'})).toBeVisible();
+  await page.getByRole('button',{name:'Bookmark reply'}).click();
+  await expect(page.getByRole('button',{name:'Bookmark reply'})).toHaveAttribute('aria-pressed','true');
+  await page.getByRole('button',{name:'Rate reply helpful'}).click();
+  await expect(page.getByRole('button',{name:'Rate reply helpful'})).toHaveAttribute('aria-pressed','true');
+  await page.getByRole('button',{name:'Quote reply'}).click();
+  await expect(message).toHaveValue(/> .*Edited branch fixture/);
+  await page.getByRole('button',{name:'Chat details'}).click();
+  await page.getByRole('button',{name:'Compare',exact:true}).click();
+  const comparison=page.getByRole('dialog');
+  await expect(comparison).toContainText('Original branch fixture');
+  await expect(comparison).toContainText('Edited branch fixture');
+  await page.reload();
+  await expect(page.getByRole('button',{name:'Branch · Edited branch fixture',exact:true})).toBeVisible();
+});
+
+test('discovers a browser-local model and verifies streaming without uploading a device key',async({page})=>{
+  const endpoint='http://127.0.0.1:11434/v1';
+  const fixtureKey='device-only-fixture';
+  const serverUploads=[];
+  page.on('request',request=>{if(request.url().startsWith('http://127.0.0.1:4187/api/')&&request.postData()?.includes(fixtureKey))serverUploads.push(request.url());});
+  const cors={'access-control-allow-origin':'*','access-control-allow-headers':'authorization,content-type','access-control-allow-methods':'GET,POST,OPTIONS'};
+  await page.route(endpoint+'/**',async route=>{
+    const request=route.request();
+    if(request.method()==='OPTIONS'){await route.fulfill({status:204,headers:cors});return;}
+    expect(request.headers().authorization).toBe('Bearer '+fixtureKey);
+    if(request.url().endsWith('/models')){await route.fulfill({json:{data:[{id:'test/local',context_length:8192}]},headers:cors});return;}
+    expect(request.postDataJSON().model).toBe('test/local');
+    await route.fulfill({headers:{...cors,'content-type':'text/event-stream'},body:'data: {"choices":[{"delta":{"content":"OK"}}]}\n\ndata: [DONE]\n\n'});
+  });
+  await page.goto('/');
+  await page.getByRole('button',{name:'Connections',exact:true}).click();
+  await page.getByRole('button',{name:'Add connection',exact:true}).first().click();
+  const editor=page.getByRole('dialog');
+  await editor.getByRole('combobox',{name:'Provider'}).selectOption('custom');
+  await editor.getByLabel(/API base URL/).fill(endpoint);
+  await editor.getByLabel(/API key/).fill(fixtureKey);
+  await editor.getByRole('button',{name:'Discover local models'}).click();
+  await editor.getByRole('combobox',{name:'Discovered model'}).selectOption('test/local');
+  await editor.getByRole('button',{name:'Test with a short prompt'}).click();
+  await expect(editor.getByRole('status')).toContainText('streamed a reply');
+  expect(serverUploads).toEqual([]);
+});
+
+test('project-only memory stays in the selected project context',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'Projects',exact:true}).click();
+  await page.getByRole('button',{name:'New project',exact:true}).first().click();
+  await page.getByLabel('Project name').fill('Scoped fixture project');
+  await page.getByLabel('Project memory').selectOption('project');
+  await page.getByRole('button',{name:'Create project',exact:true}).click();
+  await page.getByRole('button',{name:'Memory',exact:true}).click();
+  await page.getByRole('button',{name:'Add memory',exact:true}).first().click();
+  await page.getByRole('combobox',{name:'Memory scope'}).selectOption({label:'Scoped fixture project'});
+  await page.getByLabel(/What should Kapron remember/).fill('Project-only fixture fact');
+  await page.getByRole('button',{name:'Save memory'}).click();
+  await page.getByRole('button',{name:'Projects',exact:true}).click();
+  await page.getByRole('article').filter({hasText:'Scoped fixture project'}).getByRole('button',{name:'Open project'}).click();
+  await page.getByRole('textbox',{name:'Message',exact:true}).fill('Check the project-only context.');
+  const run=page.waitForRequest(request=>request.url().endsWith('/api/runs')&&request.method()==='POST');
+  await page.getByRole('button',{name:'Send message',exact:true}).click();
+  const review=page.getByRole('dialog').getByRole('button',{name:'Send message',exact:true});
+  if(await review.isVisible())await review.click();
+  expect((await run).postDataJSON().instruction).toContain('User supplied project memory:\nProject-only fixture fact');
+  await expect(page.getByRole('article',{name:'Assistant reply'})).toContainText('Check the project-only context.');
+});
+
+test('history imports, filters, pins, archives, restores and downloads a chat bundle',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'Chat history',exact:true}).click();
+  await page.getByRole('button',{name:'Import chats',exact:true}).click();
+  const bundle={format:'kapron.chat-bundle',version:1,chats:[
+    {id:'example',title:'Imported portability fixture',folder:'Research',labels:['literature'],messages:[{id:'turn',role:'user',text:'Distinct imported transcript'}]}
+  ],attachments:[{chatId:'example',name:'Imported notes.txt',text:'Searchable imported attachment text'}]};
+  await page.getByLabel('Chat export file').setInputFiles({name:'kapron.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(bundle))});
+  await expect(page.getByRole('dialog').getByRole('status')).toContainText('1 chats and 1 text attachments');
+  await page.getByRole('button',{name:'Import to workspace'}).click();
+  await page.getByLabel('Search history').fill('distinct transcript');
+  await page.getByRole('combobox',{name:'Folder'}).selectOption('Research');
+  await page.getByRole('combobox',{name:'Label'}).selectOption('literature');
+  await page.getByRole('button',{name:'Pin Imported portability fixture',exact:true}).click();
+  await page.getByRole('combobox',{name:'View'}).selectOption('pinned');
+  const box=page.getByRole('checkbox',{name:'Select Imported portability fixture'});
+  await box.check();
+  const download=page.waitForEvent('download');
+  await page.getByRole('button',{name:'Export selected chats'}).click();
+  const exported=await download;
+  const stream=await exported.createReadStream();
+  const chunks=[];
+  for await(const chunk of stream)chunks.push(chunk);
+  const saved=JSON.parse(Buffer.concat(chunks).toString());
+  expect(saved.attachments[0].text).toBe(bundle.attachments[0].text);
+  await page.getByRole('button',{name:'Archive selected'}).click();
+  await expect(box).toHaveCount(0);
+  await page.getByRole('combobox',{name:'View'}).selectOption('archived');
+  await box.check();
+  await page.getByRole('button',{name:'Restore selected'}).click();
+  await expect(box).toHaveCount(0);
+  await page.getByRole('button',{name:'Close dialog'}).click();
+  await page.getByRole('button',{name:'Search workspace',exact:true}).click();
+  await page.getByRole('textbox',{name:'Search workspace',exact:true}).fill('searchable imported attachment');
+  await page.getByRole('combobox',{name:'Type'}).selectOption('file');
+  await page.getByRole('button',{name:/Imported notes.txt/}).click();
+  await expect(page.getByRole('dialog')).toContainText('Searchable imported attachment text');
+});
+
+test('rerun and continuation review the context before dispatch',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'New chat',exact:true}).click();
+  const message=page.getByRole('textbox',{name:'Message',exact:true});
+  await message.fill('Rerun fixture prompt');
+  await page.getByRole('button',{name:'Send message',exact:true}).click();
+  const review=page.getByRole('dialog').getByRole('button',{name:'Send message',exact:true});
+  if(await review.isVisible())await review.click();
+  await expect(page.getByRole('article',{name:'Assistant reply'})).toContainText('Rerun fixture prompt');
+  await page.getByRole('button',{name:'Rerun with settings',exact:true}).click();
+  await page.getByLabel('Output token limit').fill('64');
+  await page.getByRole('button',{name:'Review rerun',exact:true}).click();
+  const rerun=page.waitForRequest(request=>request.url().endsWith('/api/runs')&&request.method()==='POST');
+  await review.click();
+  expect((await rerun).postDataJSON().options.maxOutput).toBe(64);
+  await expect(page.getByRole('article',{name:'Assistant reply'})).toContainText('Rerun fixture prompt');
+  await page.getByRole('button',{name:'Continue reply',exact:true}).click();
+  await expect(page.getByRole('dialog')).toContainText('History preview');
+  await expect(page.getByRole('checkbox',{name:'Recent chat history'})).toBeChecked();
+});
+
+test('goals persist linked work and checkpoint progress',async({page})=>{
+  const workspace=await (await page.request.get('/api/workspace')).json();
+  workspace.state.chats.push({id:'goal-source-fixture',title:'Goal source fixture',messages:[{id:'goal-source-turn',role:'user',text:'Linked evidence for the goal'}]});
+  expect((await page.request.put('/api/workspace',{headers:{'x-kapron-request':'1'},data:workspace})).ok()).toBe(true);
+  await page.goto('/');
+  await page.getByRole('button',{name:'Goals',exact:true}).click();
+  await page.getByRole('button',{name:'New goal',exact:true}).click();
+  await page.getByLabel('Goal title').fill('Verify workspace checks');
+  await page.getByRole('button',{name:'Add milestone'}).click();
+  await page.getByLabel('Milestone 1').fill('Complete first checkpoint');
+  await page.getByLabel('Checkpoint date').fill('2026-12-01');
+  await page.getByRole('combobox',{name:'Link work'}).selectOption({label:'Chat · Goal source fixture'});
+  await page.getByRole('button',{name:'Save goal'}).click();
+  await page.getByRole('checkbox',{name:/Complete first checkpoint/}).click();
+  await expect(page.getByText('1 of 1 milestones complete')).toBeVisible();
+  await page.reload();
+  await page.getByRole('button',{name:'Goals',exact:true}).click();
+  await expect(page.getByText('1 of 1 milestones complete')).toBeVisible();
+  await page.getByRole('button',{name:'Chat · Goal source fixture'}).click();
+  await expect(page.getByRole('article',{name:'Your message'})).toContainText('Linked evidence for the goal');
+});
+
+test('library organizes a reference and restores an earlier Canvas version',async({page})=>{
+  await page.goto('/');
+  await page.getByRole('button',{name:'Library',exact:true}).click();
+  await page.getByRole('button',{name:'Add to library',exact:true}).click();
+  await page.getByRole('combobox',{name:'Entry type'}).selectOption('reference');
+  await page.getByLabel('Reference title').fill('Reference fixture library');
+  await page.getByLabel('Reference URL').fill('https://example.com/reference');
+  await page.getByLabel('Reference notes').fill('Distinct reference notes');
+  await page.getByLabel('Folder',{exact:true}).fill('Reference shelf');
+  await page.getByLabel('Tags',{exact:true}).fill('study');
+  await page.getByRole('button',{name:'Save library item'}).click();
+  await page.getByRole('combobox',{name:'Library tag'}).selectOption('study');
+  const reference=page.getByRole('article').filter({hasText:'Reference fixture library'});
+  await reference.getByRole('button',{name:'Open',exact:true}).click();
+  await expect(page.getByRole('dialog').getByRole('link',{name:'Open reference'})).toHaveAttribute('href','https://example.com/reference');
+  await page.getByRole('button',{name:'Close dialog'}).click();
+  await page.getByRole('button',{name:'Canvas',exact:true}).click();
+  await page.getByRole('button',{name:'New artifact',exact:true}).click();
+  await page.getByLabel('Title',{exact:true}).fill('Versioned library fixture');
+  const content=page.getByRole('textbox',{name:'Content',exact:true});
+  await content.fill('First version');
+  await page.getByRole('button',{name:'Save artifact'}).click();
+  const edit=page.getByRole('button',{name:'Edit Versioned library fixture'});
+  await edit.click();
+  await content.fill('Second version');
+  await page.getByRole('button',{name:'Save artifact'}).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await edit.click();
+  await page.getByText('Version history',{exact:true}).click();
+  await page.getByRole('button',{name:'Restore version 1 to editor'}).click();
+  await expect(content).toHaveValue('First version');
+});

@@ -1,12 +1,22 @@
-import {useState} from 'react';
+import {useEffect,useState} from 'react';
 import {attachmentAccept,attachmentText,isPdf} from './attachments.js';
 import {Modal} from './dialogs.jsx';
-import {taskFamilies} from '../server/routing.js';
+import {chooseModel,rulesDecision,taskFamilies} from '../server/routing.js';
+import {estimateRun} from '../server/model-policy.js';
+import {get} from './api.js';
 
-export function RoutingSettings({settings,onClose,onSave,vaultAvailable}){
+export function RoutingSettings({state,settings,onClose,onSave,vaultAvailable}){
   const [cloud,setCloud]=useState(!!settings?.cloud),[laya,setLaya]=useState(settings?.laya??'');
   const [preference,setPreference]=useState(settings?.preference??'balanced');
+  const [maxRunUsd,setMaxRunUsd]=useState(settings?.maxRunUsd?.toString()??'');
+  const [cases,setCases]=useState(settings?.evaluationCases??[]),[results,setResults]=useState(null);
+  const [quota,setQuota]=useState(null);
   const [key,setKey]=useState(''),[remove,setRemove]=useState(false),[error,setError]=useState(''),[busy,setBusy]=useState(false);
+  useEffect(()=>{
+    const controller=new AbortController();
+    get('model-quota',{signal:controller.signal}).then(setQuota).catch(()=>{});
+    return ()=>controller.abort();
+  },[]);
   return <Modal title="Auto routing" onClose={onClose}><form className="modal-form" onSubmit={async e=>{
     e.preventDefault();setError('');setBusy(true);
     try{
@@ -15,12 +25,41 @@ export function RoutingSettings({settings,onClose,onSave,vaultAvailable}){
         if(url.protocol!=='http:'||!['127.0.0.1','localhost','[::1]'].includes(url.hostname)||url.pathname!=='/decide'||url.search||url.hash||url.username||url.password)
           throw new Error('Use the Laya companion’s loopback /decide URL.');
       }
-      await onSave({cloud,preference,laya:laya.trim()},key.trim(),remove);
+      const budget=maxRunUsd===''?undefined:Number(maxRunUsd);
+      if(budget!==undefined&&(!Number.isFinite(budget)||budget<0||budget>1000))throw new Error('Enter a per-call estimate limit from USD 0 to 1,000.');
+      await onSave({...settings,cloud,preference,laya:laya.trim(),maxRunUsd:budget,evaluationCases:cases},key.trim(),remove);
     }catch(error){setError(error.message);setBusy(false);}
   }}>
-    <label>Model preference<select value={preference} onChange={e=>setPreference(e.target.value)}>
-      <option value="balanced">Balanced</option><option value="quality">Quality</option><option value="economy">Economy</option>
+    <label>Model preference<select value={preference} onChange={e=>{setPreference(e.target.value);setResults(null);}}>
+      <option value="balanced">Balanced</option><option value="quality">Quality</option><option value="economy">Economy</option><option value="latency">Low latency</option>
     </select></label>
+    <label>Maximum estimated USD per model call<input type="number" min="0" max="1000" step="0.000001" value={maxRunUsd} onChange={e=>{setMaxRunUsd(e.target.value);setResults(null);}} placeholder="No preflight limit"/></label>
+    <p className="hint">Kapron checks the estimate before sending model context. Enter input and output prices on each connection you want to use. Provider billing can differ from estimates.</p>
+    {quota?.limit!=null&&<p className="hint">Daily server model quota · {quota.used.toLocaleString()} of {quota.limit.toLocaleString()} request units reserved · {quota.day} UTC</p>}
+    <details className="advanced"><summary>Routing evaluations</summary><p className="hint">Save test prompts and expected routes in this workspace. The dry run uses local rules and connection settings. It makes no provider calls.</p>
+      {cases.map((item,index)=>{
+        const update=patch=>{setCases(cases.map((entry,i)=>i===index?{...entry,...patch}:entry));setResults(null);};
+        return <div className="modal-form" key={index}><label>Evaluation prompt {index+1}<textarea maxLength={1400} rows={2} value={item.prompt} onChange={e=>update({prompt:e.target.value})}/></label>
+          <div className="select-model"><label>Expected family<select value={item.family} onChange={e=>update({family:e.target.value})}>{Object.keys(taskFamilies).map(name=><option key={name}>{name}</option>)}</select></label>
+            <label>Expected connection<select value={item.connectionId} onChange={e=>update({connectionId:e.target.value})}><option value="">Any</option>{state.connections.map(connection=><option key={connection.id} value={connection.id}>{connection.name}</option>)}</select></label></div>
+          {results?.[index]&&<p role="status">{results[index]}</p>}
+          <button type="button" className="button secondary" onClick={()=>{setCases(cases.filter((_,i)=>i!==index));setResults(null);}}>Remove case {index+1}</button>
+        </div>;
+      })}
+      <div className="flow-row"><button type="button" className="button secondary" disabled={cases.length>=10} onClick={()=>{setCases([...cases,{prompt:'',family:'general',connectionId:''}]);setResults(null);}}>Add evaluation case</button>
+        <button type="button" className="button secondary" disabled={!cases.length} onClick={()=>setResults(cases.map(item=>{
+          if(!item.prompt.trim())return 'Enter an evaluation prompt.';
+          const {family}=rulesDecision(item.prompt,{skills:[],knowledge:[]});
+          const context={messages:[{role:'user',text:item.prompt}],instruction:''};
+          const limits={...state.settings.options,maxRunUsd:maxRunUsd===''?undefined:Number(maxRunUsd)};
+          const options={...state.settings.options,maxOutput:state.settings.options?.maxOutput??2048};
+          const available=state.connections.filter(c=>!estimateRun(c,c.model,context,options,limits).error);
+          const connection=chooseModel(available,family,item.prompt.length+options.maxOutput*4,preference);
+          const estimate=connection&&estimateRun(connection,connection.model,context,options,limits);
+          const pass=family===item.family&&(!item.connectionId||connection?.id===item.connectionId);
+          return (pass?'Pass':'Mismatch')+' · '+family+' · '+(connection?.model??'No matching connection')+(estimate?.estimatedUsd!==undefined?' · USD '+estimate.estimatedUsd.toFixed(6):'')+(connection?.capability?.latencyMs?' · reference '+connection.capability.latencyMs+' ms':'');
+        }))}>Run routing evaluation</button></div>
+    </details>
     <label className="checkbox"><input type="checkbox" checked={cloud} disabled={!vaultAvailable} onChange={e=>setCloud(e.target.checked)}/>Allow Jev via BeatAPI</label>
     <p className="hint">When enabled, BeatAPI receives a short excerpt of the current prompt and descriptions of eligible resources. File contents and saved memory stay out of this decision request.</p>
     <label>BeatAPI key<input type="password" autoComplete="off" disabled={!vaultAvailable||remove} value={key} maxLength={4000} onChange={e=>setKey(e.target.value)} placeholder="Leave blank to keep the saved key"/></label>

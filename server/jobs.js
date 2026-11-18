@@ -2,6 +2,7 @@ import {initial,modelOptions,assembleContext,getConnection} from './state.js';
 import {chooseModel,routingCandidates,rulesDecision} from './routing.js';
 import {isGateway} from './providers.js';
 import {gatewayConfig} from './gateway.js';
+import {estimateRun} from './model-policy.js';
 
 import {notebookAvailable,notebookCall,notebookIdPattern} from './notebooklm.js';
 
@@ -130,15 +131,16 @@ async function resolveStep(env,row,definition,step,prior,execute,decide){
   const length=context.instruction.length+context.messages.reduce((n,m)=>n+m.text.length,0);
   const saved=new Set((await list(env,'SELECT connection,provider FROM kapron_vault WHERE owner=?',row.owner)).map(x=>x.connection+':'+x.provider));
   const activeGateway=gatewayConfig(env)?.provider;
-  const vaultConnections=state.connections.filter(c=>c.mode==='vault'&&saved.has(c.id+':'+c.provider)&&(!isGateway(c.provider)||c.provider===activeGateway));
+  const vaultConnections=state.connections.filter(c=>c.mode==='vault'&&saved.has(c.id+':'+c.provider)&&(!isGateway(c.provider)||c.provider===activeGateway)
+    &&!estimateRun(c,c.model,context,{maxOutput:2048},{...state.settings.options,maxRunUsd:state.settings.routing?.maxRunUsd}).error);
   const connection=use.connectionId==='auto'
     ? chooseModel(vaultConnections,routing.family,length,state.settings.routing?.preference,scope.abliterated?routing.profile:undefined)??(!state.connections.length?getConnection(state,'demo'):null)
     : getConnection(state,use.connectionId);
   if(!connection||!['demo','vault'].includes(connection.mode))throw fail(409,'The selected model has no usable background connection.');
   const model=use.connectionId==='auto'?connection.model:use.model;
-  const text=await execute(env,row.owner,{connectionId:connection.id,model,...context,options:{maxOutput:2048}});
+  const resultText=await execute(env,row.owner,{connectionId:connection.id,model,...context,options:{maxOutput:2048,reportUsage:connection.capability?.reportUsage===true}});
   const {profile,...details}=routing;
-  return {label:step.label,text,model,engine:result?.engine??'rules',...details,
+  return {label:step.label,...resultText,model,engine:result?.engine??'rules',...details,
     ...(scope.abliterated&&profile==='abliterated'&&connection.routing?.profile==='abliterated'?{profile}:{})};
 }
 
@@ -209,12 +211,16 @@ export async function setSchedule(env,owner,workflowId){
 }
 
 export async function createShare(env,owner,input){
+  if(!input||!['chat','artifact'].includes(input.kind)||typeof input.id!=='string')throw fail(400,'Select a chat or artifact to share.');
+  const days=input.days??7;
+  if(![1,7,30].includes(days)||('download' in input&&typeof input.download!=='boolean'))throw fail(400,'Choose a valid expiry and download policy.');
   const state=await loadWorkspace(env,owner);
   const item=input.kind==='chat'?state.chats.find(c=>c.id===input.id)
     : input.kind==='artifact'?(state.artifacts??[]).find(a=>a.id===input.id):null;
   if(!item)throw fail(404,'The item is unavailable.');
-  const id=crypto.randomUUID(), expires=clock()+7*86400000;
+  const id=crypto.randomUUID(), expires=clock()+days*86400000;
   const snapshot=input.kind==='chat'?{title:item.title,messages:item.messages.map(m=>({role:m.role,text:m.text}))}:{title:item.name,text:item.text};
+  if(input.download===true)snapshot.download=true;
   await write(env,'INSERT INTO kapron_share VALUES(?,?,?,?)',id,owner,JSON.stringify(snapshot),expires);
   return {id,expires};
 }

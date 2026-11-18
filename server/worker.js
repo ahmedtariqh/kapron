@@ -1,6 +1,7 @@
 import {assets} from './generated-assets.js';
 import {providers, providerRequest, sse, extractText, providerError, isGateway} from './providers.js';
 import {gatewayConfig, gatewayModels} from './gateway.js';
+import {estimateRun,reportedUsage} from './model-policy.js';
 import {initial} from './state.js';
 import {seal, unseal} from './vault.js';
 import {authenticate,authenticatedOwner} from './auth.js';
@@ -43,8 +44,16 @@ function workspaceValid(s) {
   if(lists.some(k=>s[k].length>250 || s[k].some(x=>!x || !keyId(x.id)))) return false;
   if(s.chats.some(c=>!Array.isArray(c.messages) || c.messages.length>500 ||
     c.messages.some(m=>!m || !keyId(m.id) || !['assistant','user'].includes(m.role) || typeof m.text!=='string'))) return false;
-  const extensions=['skills','knowledge','workflows','tasks','artifacts'];
+  if(s.chats.some(c=>(c.folder!==undefined&&(typeof c.folder!=='string'||c.folder.length>80))||
+    (c.pinnedFacts!==undefined&&(typeof c.pinnedFacts!=='string'||c.pinnedFacts.length>4000))||
+    (c.historyChars!==undefined&&(!Number.isInteger(c.historyChars)||c.historyChars<2000||c.historyChars>150000))||
+    (c.labels!==undefined&&(!Array.isArray(c.labels)||c.labels.length>12||c.labels.some(label=>typeof label!=='string'||label.length>32)))))return false;
+  const extensions=['skills','knowledge','workflows','tasks','artifacts','goals'];
   if(extensions.some(k=>s[k]!==undefined && (!Array.isArray(s[k])||s[k].length>250||s[k].some(x=>!x||!keyId(x.id)))))return false;
+  if((s.goals??[]).some(goal=>!['active','paused','done'].includes(goal.status)||typeof goal.title!=='string'||!goal.title.trim()||goal.title.length>120||
+    typeof goal.description!=='string'||goal.description.length>4000||!Array.isArray(goal.milestones)||goal.milestones.length>25||
+    goal.milestones.some(item=>!item||!keyId(item.id)||typeof item.title!=='string'||!item.title.trim()||item.title.length>120||typeof item.done!=='boolean')||
+    !Array.isArray(goal.links)||goal.links.length>25||goal.links.some(link=>!link||!['chat','artifact','workflow','run'].includes(link.kind)||!keyId(link.id))))return false;
   if(['skills','knowledge'].some(k=>(s[k]??[]).some(x=>typeof x.name!=='string'||typeof x.text!=='string'||x.text.length>40000||
     (x.description!==undefined&&typeof x.description!=='string'))))return false;
   if(s.connections.some(c=>!providerCanRelay(c.provider) && c.provider!=='custom')) return false;
@@ -70,6 +79,23 @@ function checkMutation(request) {
 }
 function keyContext(owner,id,provider) {return JSON.stringify([owner,id,provider]);}
 
+const utcDay=()=>new Date().toISOString().slice(0,10);
+function dailyModelLimit(env){
+  if(env.KAPRON_DAILY_MODEL_UNITS==null||env.KAPRON_DAILY_MODEL_UNITS==='')return null;
+  const value=Number(env.KAPRON_DAILY_MODEL_UNITS);
+  if(!Number.isSafeInteger(value)||value<0)throw new Problem(503,'The deployment model quota is invalid.');
+  return value;
+}
+
+async function reserveModelQuota(env,owner,amount,limit){
+  if(limit===null)return;
+  if(amount>limit)throw new Problem(429,'This request exceeds the daily server model quota.');
+  const result=await env.DB.prepare(`INSERT INTO kapron_model_quota (owner,utc_day,reserved) VALUES (?,?,?)
+    ON CONFLICT(owner,utc_day) DO UPDATE SET reserved=reserved+excluded.reserved WHERE reserved<=?-excluded.reserved`)
+    .bind(owner,utcDay(),amount,limit).run();
+  if(result.meta.changes!==1)throw new Problem(429,'The daily server model quota has been reached.');
+}
+
 async function vaultModelKey(env, ownerId, id, provider) {
   if(!env.KAPRON_VAULT_KEY)throw new Problem(503,'The server vault is not configured.');
   const row=await env.DB.prepare('SELECT provider,sealed FROM kapron_vault WHERE owner=? AND connection=?').bind(ownerId,id).first();
@@ -87,7 +113,7 @@ async function listGatewayModels(request, env, owner) {
     ? input.key.trim()
     : keyId(input.connectionId) ? await vaultModelKey(env,owner.id,input.connectionId,gateway.provider) : '';
   if(!key||key.length>4000)throw new Problem(400,'Enter a gateway virtual key.');
-  const result=await gatewayModels(gateway,key,env.MODEL_FETCH??fetch,request.signal).catch(()=>null);
+  const result=await gatewayModels(gateway,key,env.MODEL_FETCH??fetch,request.signal,input.details===true).catch(()=>null);
   if(!result)throw new Problem(424,'Could not load models from the configured gateway.');
   if(result.status)throw new Problem(424,providerError(result.status));
   return json(result);
@@ -125,8 +151,8 @@ function streamResponse(iterator,abort) {
     async pull(controller){
       try {
         const {done,value}=await iterator.next();
-        if(done){controller.enqueue(packet({done:true}));controller.close();abort();return;}
-        controller.enqueue(packet({delta:value}));
+        if(done){controller.enqueue(packet({done:true,...(value?{finishReason:value}:{})}));controller.close();abort();return;}
+        controller.enqueue(packet(typeof value==='string'?{delta:value}:value));
       } catch(error) {
         controller.enqueue(packet({error:error?.message || 'Streaming failed.'}));
         controller.close();abort();
@@ -141,13 +167,16 @@ async function run(request,env,owner) {
   validateRun(input);
   const abort=new AbortController();
   const timeout=setTimeout(()=>abort.abort(),110000);
-  const stop=()=>{clearTimeout(timeout);abort.abort();};
+  const stop=()=>{clearTimeout(timeout);request.signal.removeEventListener('abort',stop);abort.abort();};
   request.signal.addEventListener('abort',stop,{once:true});
   if(input.connectionId==='demo') return streamResponse(demoReply(input,abort.signal),stop);
   try {
     const row=await env.DB.prepare('SELECT document FROM kapron_workspace WHERE owner=?').bind(owner.id).first();
-    const connection=row && JSON.parse(row.document).connections.find(c=>c.id===input.connectionId);
+    const workspace=row&&JSON.parse(row.document);
+    const connection=workspace?.connections.find(c=>c.id===input.connectionId);
     if(!connection || !providerCanRelay(connection.provider)) throw new Problem(400,'Select a supported server connection.');
+    const estimate=estimateRun(connection,input.model,input,input.options??{}, {...workspace.settings.options,maxRunUsd:workspace.settings.routing?.maxRunUsd});
+    if(estimate.error)throw new Problem(422,estimate.error);
     const gateway=isGateway(connection.provider)?gatewayConfig(env):null;
     if(isGateway(connection.provider)&&gateway?.provider!==connection.provider)throw new Problem(409,'This model gateway is unavailable.');
     let key;
@@ -157,9 +186,14 @@ async function run(request,env,owner) {
       key=input.deviceKey;
     }
     if(!key || key.length>4000) throw new Problem(400,'This connection has no usable API key.');
-    let upstream;
+    let upstream, outgoing;
+    const dailyLimit=dailyModelLimit(env);
+    const maxOutput=estimate.maxOutput??(dailyLimit===null?undefined:2048);
     try {
-      const outgoing=providerRequest({...input,endpoint:gateway?.endpoint,provider:connection.provider,key,signal:abort.signal});
+      outgoing=providerRequest({...input,options:{...input.options,maxOutput},endpoint:gateway?.endpoint,provider:connection.provider,key,signal:abort.signal});
+    }catch(error){throw new Problem(400,error.message);}
+    await reserveModelQuota(env,owner.id,estimate.inputBytes+(maxOutput??0),dailyLimit);
+    try {
       upstream=await (env.MODEL_FETCH??fetch)(outgoing);
     } catch(e) {
       if(e instanceof TypeError || e?.name==='AbortError') throw new Problem(502,'The provider connection failed or timed out.');
@@ -167,8 +201,15 @@ async function run(request,env,owner) {
     }
     if(!upstream.ok){await upstream.body?.cancel();throw new Problem(502,providerError(upstream.status));}
     const chunks=(async function*(){
-      let count=0;
+      let count=0, usage, upstreamModel, finishReason;
       for await (const event of sse(upstream)) {
+        const observed=reportedUsage(connection.provider,event);
+        if(observed)usage={...usage,...observed};
+        const identity=event.model??event.modelVersion;
+        if(typeof identity==='string'&&/^[\w.:/\-]{1,160}$/.test(identity))upstreamModel=identity;
+        const reason=event.choices?.[0]?.finish_reason??event.candidates?.[0]?.finishReason;
+        if(['length','MAX_TOKENS'].includes(reason))finishReason='length';
+        if(['content_filter','SAFETY','RECITATION'].includes(reason))finishReason='content_filter';
         const chunk=extractText(connection.provider,event);
         if(!chunk) continue;
         count+=chunk.length;
@@ -176,6 +217,8 @@ async function run(request,env,owner) {
         yield chunk;
       }
       if(!count) throw new Error('The provider returned no visible text.');
+      if(usage||upstreamModel)yield {usage,upstreamModel};
+      return finishReason;
     })();
     return streamResponse(chunks,stop);
   } catch(e){stop();throw e;}
@@ -184,11 +227,13 @@ async function run(request,env,owner) {
 async function executeJobModel(env,ownerId,input){
   const request=new Request('https://kapron.invalid/api/runs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(input)});
   const response=await run(request,env,{id:ownerId});
-  let text='';
+  let text='', usage, upstreamModel;
   for await(const event of sse(response)){
     if(event.error)throw new Error(event.error);
     if(event.delta)text+=event.delta;
-    if(event.done)return text;
+    if(event.usage)usage=event.usage;
+    if(event.upstreamModel)upstreamModel=event.upstreamModel;
+    if(event.done)return {text,usage,upstreamModel};
   }
   throw new Error('The model stream did not complete.');
 }
@@ -201,9 +246,87 @@ async function decision(env,owner,state,chat,scope,prompt,request=new Request('h
   return decideWithJev({env,owner,state,chat,scope,prompt,request,key});
 }
 const tick=env=>tickJobs(env,executeJobModel,(env,id,...args)=>decision(env,{id},...args));
+
+async function integrationModels(env,owner){
+  const state=await loadWorkspace(env,owner);
+  const {results}=await env.DB.prepare('SELECT connection,provider FROM kapron_vault WHERE owner=?').bind(owner).all();
+  const keys=new Set(results.map(row=>row.connection+':'+row.provider));
+  const gateway=gatewayConfig(env)?.provider;
+  return state.connections.filter(connection=>connection.mode==='vault'&&providerCanRelay(connection.provider)
+    &&(!isGateway(connection.provider)||connection.provider===gateway)&&keys.has(connection.id+':'+connection.provider));
+}
+
+function integrationMessages(messages){
+  const valid=Array.isArray(messages)&&messages.length>0&&messages.length<=32
+    &&messages.every(message=>['user','assistant','system','developer'].includes(message?.role)&&typeof message.content==='string');
+  if(!valid||!messages.some(message=>message.role==='user'))throw new Problem(400,'Supply text messages including at least one user message.');
+  const firstTurn=messages.findIndex(message=>['user','assistant'].includes(message.role));
+  if(messages.slice(firstTurn).some(message=>['system','developer'].includes(message.role)))throw new Problem(400,'Put system and developer instructions before the conversation.');
+  return {instruction:messages.slice(0,firstTurn).map(message=>message.content).join('\n\n'),
+    messages:messages.slice(firstTurn).map(message=>({role:message.role,text:message.content}))};
+}
+
+async function integrationChat(request,env,owner){
+  const input=await readJson(request,250000);
+  const supported=['model','messages','stream','stream_options','max_completion_tokens','max_tokens','temperature'];
+  if(!input||Array.isArray(input)||Object.keys(input).some(key=>!supported.includes(key)))throw new Problem(400,'Unsupported chat completion field.');
+  const context=integrationMessages(input.messages);
+  const target=(await integrationModels(env,owner)).find(connection=>connection.id===input.model);
+  if(!target)throw new Problem(404,'Select a vault model ID from the Kapron model list.');
+  const maxOutput=input.max_completion_tokens??input.max_tokens;
+  if(maxOutput!==undefined&&(!Number.isInteger(maxOutput)||maxOutput<16||maxOutput>32768))throw new Problem(400,'Use an output token limit from 16 to 32,768.');
+  const requestUsage=input.stream_options?.include_usage===true;
+  const payload={...context,connectionId:target.id,model:target.model,options:{maxOutput,temperature:input.temperature,reportUsage:target.capability?.reportUsage===true}};
+  const response=await run(new Request(request.url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload),signal:request.signal}),env,{id:owner});
+  const id='chatcmpl-'+crypto.randomUUID();
+  const created=Math.floor(Date.now()/1000);
+  const usageShape=usage=>usage&&Object.fromEntries(Object.entries({prompt_tokens:usage.input,completion_tokens:usage.output,total_tokens:usage.total}).filter(([,value])=>value!==undefined));
+  if(input.stream===true){
+    const iterator=sse(response);
+    let usage;
+    const encoder=new TextEncoder();
+    const write=(controller,value)=>controller.enqueue(encoder.encode('data: '+(typeof value==='string'?value:JSON.stringify(value))+'\n\n'));
+    const chunk=(delta,finish=null)=>({id,created,object:'chat.completion.chunk',model:target.id,choices:[{index:0,delta,finish_reason:finish}]});
+    const body=new ReadableStream({
+      start(controller){write(controller,chunk({role:'assistant'}));},
+      async pull(controller){
+        try{
+          for(;;){
+            const {value:event,done}=await iterator.next();
+            if(done)throw new Error('Model stream disconnected.');
+            if(event.error)throw new Error(event.error);
+            if(event.usage)usage=usageShape(event.usage);
+            if(event.delta){write(controller,chunk({content:event.delta}));return;}
+            if(event.done){
+              write(controller,chunk({},event.finishReason??'stop'));
+              if(requestUsage&&usage)write(controller,{...chunk({}),choices:[],usage});
+              write(controller,'[DONE]');controller.close();await iterator.return();return;
+            }
+          }
+        }catch(error){write(controller,{error:{message:error.message,type:'upstream_error'}});controller.close();await iterator.return();}
+      },
+      cancel(){return iterator.return();}
+    });
+    return new Response(body,{headers:{...noCache,'content-type':'text/event-stream; charset=utf-8'}});
+  }
+  let text='',usage,finishReason;
+  for await(const event of sse(response)){
+    if(event.error)throw new Problem(424,event.error);
+    if(event.delta)text+=event.delta;
+    if(event.usage)usage=usageShape(event.usage);
+    if(event.done){finishReason=event.finishReason??'stop';break;}
+  }
+  if(!finishReason)throw new Problem(424,'Model stream disconnected.');
+  return json({id,created,object:'chat.completion',model:target.id,choices:[{index:0,message:{role:'assistant',content:text},finish_reason:finishReason}],...(usage?{usage}:{})});
+}
+
 async function integration(request,env,path){
   const owner=await apiKeyOwner(env,request.headers.get('authorization'));
   if(!owner)throw new Problem(401,'A valid Kapron bearer key is required.');
+  if(path==='/api/v1/models'&&request.method==='GET'){
+    return json({object:'list',data:(await integrationModels(env,owner)).map(connection=>({id:connection.id,object:'model',created:0,owned_by:connection.provider}))});
+  }
+  if(path==='/api/v1/chat/completions'&&request.method==='POST')return integrationChat(request,env,owner);
   if(path==='/api/v1/runs'&&request.method==='GET')return json({runs:await listJobs(env,owner)});
   const lookup=path.match(/^\/api\/v1\/runs\/([a-zA-Z0-9-]{1,180})$/);
   if(lookup&&request.method==='GET'){
@@ -227,6 +350,13 @@ async function integration(request,env,path){
 
 async function api(request,env,path) {
   if(path.startsWith('/api/v1/'))return integration(request,env,path);
+  const sharedDownload=path.match(/^\/api\/public-share\/([a-zA-Z0-9-]{36})\/download$/);
+  if(sharedDownload&&request.method==='GET'){
+    const snapshot=await sharedSnapshot(env,sharedDownload[1]);
+    if(snapshot.download!==true)throw new Problem(403,'Downloads are disabled for this snapshot.');
+    const content=snapshot.messages?snapshot.messages.map(message=>(message.role==='user'?'User':'Assistant')+'\n'+message.text).join('\n\n'):snapshot.text;
+    return new Response(snapshot.title+'\n\n'+content,{headers:{...noCache,'content-type':'text/plain; charset=utf-8','content-disposition':'attachment; filename="kapron-snapshot.txt"'}});
+  }
   const share=path.match(/^\/api\/public-share\/([a-zA-Z0-9-]{36})$/);
   if(share&&request.method==='GET')return json(await sharedSnapshot(env,share[1]));
   if(path==='/api/auth-config'&&request.method==='GET')return json({mode:env.KAPRON_SUPABASE_URL?'email':'sites'});
@@ -242,6 +372,11 @@ async function api(request,env,path) {
   if(method!=='GET') checkMutation(request);
   if(path==='/api/session' && method==='GET') return json({user:owner,vaultAvailable:!!env.KAPRON_VAULT_KEY,gatewayProvider:gatewayConfig(env)?.provider??null,authMode:env.KAPRON_SUPABASE_URL?'email':'sites'});
   if(path==='/api/gateway-models'&&method==='POST')return listGatewayModels(request,env,owner);
+  if(path==='/api/model-quota'&&method==='GET'){
+    const limit=dailyModelLimit(env), day=utcDay();
+    const row=limit===null?null:await env.DB.prepare('SELECT reserved FROM kapron_model_quota WHERE owner=? AND utc_day=?').bind(owner.id,day).first();
+    return json({limit,used:row?.reserved??0,day});
+  }
   if(path==='/api/connection-readiness'&&method==='GET'){
     const {results}=await env.DB.prepare('SELECT connection,provider FROM kapron_vault WHERE owner=?').bind(owner.id).all();
     const activeGateway=gatewayConfig(env)?.provider;
@@ -329,7 +464,7 @@ async function api(request,env,path) {
       {type:'prompt',label:'Review the output',prompt:'Review the previous output against this goal and revise where needed: '+values.goal}
     ]});
     if(!selected)throw new Problem(400,'Select a vault model for planning or use the demo template.');
-    const text=await executeJobModel(env,owner.id,{connectionId:selected.id,model:selected.model,
+    const {text}=await executeJobModel(env,owner.id,{connectionId:selected.id,model:selected.model,
       instruction:'Return only a JSON array of 1 to 5 ordered model-only steps, each with a short label and a specific prompt. Do not request external actions or credentials. The user will review your proposal before execution.',
       messages:[{role:'user',text:values.goal}],options:{maxOutput:1800}});
     let nodes;

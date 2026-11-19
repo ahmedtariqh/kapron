@@ -1,0 +1,1 @@
+ALTER TABLE kapron_job ADD COLUMN model_calls INTEGER NOT NULL DEFAULT 0;

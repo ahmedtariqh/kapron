@@ -8,7 +8,7 @@ import {parseDecision,routingCandidates,chooseModel} from '../server/routing.js'
 
 function fixture(overrides={}){
   const db=new DatabaseSync(':memory:');
-  for(const migration of ['0000_workspace','0001_execution','0002_model_quota','0003_workflow_webhook']) db.exec(readFileSync('drizzle/'+migration+'.sql','utf8'));
+  for(const migration of ['0000_workspace','0001_execution','0002_model_quota','0003_workflow_webhook','0004_job_model_calls']) db.exec(readFileSync('drizzle/'+migration+'.sql','utf8'));
   const env={KAPRON_TRUST_SITES_IDENTITY:'1',KAPRON_VAULT_KEY:Buffer.alloc(32,4).toString('base64'),...overrides,DB:{
     prepare(sql){return {bind(...args){return {
       async first(){return db.prepare(sql).get(...args);},
@@ -705,5 +705,65 @@ test('Cowork inbox filters runs before the history limit and keeps owners isolat
     const attention=await (await request('jobs?filter=attention')).json();
     assert.deepEqual(attention.runs.map(run=>run.id),['older-needs-attention']);
     assert.equal((await request('jobs?filter=invalid')).status,400);
+  }finally{db.close();}
+});
+
+test('a delivery check records its source, blocks subsequent work, and can be replayed',async()=>{
+  const {request,tick,db}=fixture();
+  const queue=expected=>request('jobs',{method:'POST',body:{
+    name:'Delivery check',connectionId:'demo',policy:'fixed',nodes:[
+      {type:'prompt',label:'Brief',prompt:'Draft a quality-check fixture.'},
+      {type:'check',label:'Review brief',rule:'contains',expected},
+      {type:'prompt',label:'Follow-up',prompt:'Continue.'}
+    ]
+  }});
+  const getRun=id=>request('jobs/'+id).then(r=>r.json());
+  try{
+    assert.equal((await queue('   ')).status,400);
+    const {id}=await (await queue('A never generated required phrase')).json();
+    await tick();await tick();await tick();
+    const blocked=await getRun(id);
+    assert.equal(blocked.status,'blocked');
+    assert.equal(blocked.cursor,1);
+    assert.deepEqual(blocked.outputs.map(output=>[output.label,output.check,output.source]),[
+      ['Brief',undefined,undefined],['Review brief','failed','Brief']
+    ]);
+    assert.equal((await request('jobs/'+id+'/replay',{user:'bob',method:'POST'})).status,404);
+    const replay=await request('jobs/'+id+'/replay',{method:'POST'});
+    assert.equal(replay.status,202);
+    const copy=await getRun((await replay.json()).id);
+    assert.equal(copy.definition.replayOf,id);
+    assert.equal(copy.cursor,0);
+    assert.equal(copy.modelCalls,0);
+    assert.equal((await getRun(id)).status,'blocked');
+  }finally{db.close();}
+});
+
+test('per-run model-call budgets survive retries and concurrent parallel branches',async()=>{
+  let calls=0;
+  const {request,tick,db}=fixture({MODEL_FETCH:async()=>{calls++;return packet('Generated fixture');}});
+  const state=initial();
+  state.connections=[{id:'source',provider:'openai',model:'fixture',mode:'vault'}];
+  const payload={name:'Budget',policy:'fixed',connectionId:'source',maxModelCalls:1,nodes:[
+    {type:'parallel',nodes:[{type:'prompt',label:'One',prompt:'First task'},{type:'prompt',label:'Two',prompt:'Second task'}]}
+  ]};
+  try{
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    await request('vault/source',{method:'PUT',body:{provider:'openai',key:'fixture-key'}});
+    assert.equal((await request('jobs',{method:'POST',body:{...payload,maxModelCalls:0}})).status,400);
+    const submitted=await request('jobs',{method:'POST',body:payload});
+    assert.equal(submitted.status,202);
+    const {id}=await submitted.json();
+    await Promise.all([tick(),tick()]);
+    const run=await (await request('jobs/'+id)).json();
+    assert.equal(calls,1);
+    assert.equal(run.status,'blocked');
+    assert.equal(run.modelCalls,1);
+    assert.equal(run.outputs.filter(output=>output.text).length,1);
+    assert.match(run.outputs.find(output=>output.error).error,/budget/);
+    await request('jobs/'+id,{method:'PATCH',body:{action:'resume'}});
+    await tick();
+    assert.equal(calls,1);
+    assert.equal((await (await request('jobs/'+id)).json()).modelCalls,1);
   }finally{db.close();}
 });

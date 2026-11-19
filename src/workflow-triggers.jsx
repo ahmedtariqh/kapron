@@ -61,7 +61,8 @@ export function WorkflowTriggers({workflow,onClose}){
         setPreview(await get(path+'/preview',{method:'POST'}));
       })}>Dry-run plan</button></div>
       {preview&&<div><p>Connection {preview.connectionId} · {preview.policy} policy</p>
-        <ol>{preview.steps.map((step,index)=><li key={index}>{step.label}{step.parallel?' · '+step.parallel+' parallel steps':''}</li>)}</ol></div>}
+        {preview.maxModelCalls!=null&&<p>Model-call budget · {preview.maxModelCalls} attempts</p>}
+        <ol>{preview.steps.map((step,index)=><li key={index}>{step.label}{step.rule==='contains'?' · Contains “'+step.expected+'”':step.rule==='length'?' · Minimum '+step.expected+' characters':''}{step.parallel?' · '+step.parallel+' parallel steps':''}</li>)}</ol></div>}
       {notice&&<p role="status">{notice}</p>}
       {error&&<p role="alert" className="form-error">{error}</p>}
     </div>

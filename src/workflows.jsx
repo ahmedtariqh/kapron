@@ -3,14 +3,15 @@ import {ArrowDown,ArrowUp,FileText,GitBranch,Play,Plus,Trash2} from 'lucide-reac
 import {get} from './api.js';
 import {Modal} from './dialogs.jsx';
 import {schemaFromText} from '../server/structured.js';
+import {modelCallBudget} from '../server/jobs.js';
 import {isGateway} from '../server/providers.js';
 
 const createStep=type=>({
   type,label:'',...(['prompt','gem','notebooklm'].includes(type)?{prompt:''}:{}),
   ...(['condition','loop','parallel'].includes(type)?{nodes:[{type:'prompt',prompt:'',label:''}]}:{}),
-  ...(type==='approval'?{note:''}:{}),...(type==='condition'?{contains:''}:{}),...(type==='loop'?{count:2}:{})
+  ...(type==='approval'?{note:''}:{}),...(type==='check'?{rule:'contains',expected:''}:{}),...(type==='condition'?{contains:''}:{}),...(type==='loop'?{count:2}:{})
 });
-const nodeTypes={prompt:'Prompt',gem:'Gem',file:'Project file',condition:'Condition',approval:'Approval',loop:'Repeat',parallel:'Parallel group',workflow:'Nested workflow',notebooklm:'Ask NotebookLM'};
+const nodeTypes={prompt:'Prompt',gem:'Gem',file:'Project file',condition:'Condition',approval:'Approval',check:'Delivery check',loop:'Repeat',parallel:'Parallel group',workflow:'Nested workflow',notebooklm:'Ask NotebookLM'};
 
 function StepList({nodes,onChange,state,projectId,depth=0,parallel=false,notebooks,notebookError}){
   const patch=(i,value)=>onChange(nodes.map((node,index)=>i===index?{...node,...value}:node));
@@ -19,7 +20,7 @@ function StepList({nodes,onChange,state,projectId,depth=0,parallel=false,noteboo
     [items[i],items[next]]=[items[next],items[i]];
     onChange(items);
   }
-  const allowed=parallel?['prompt','gem','file','notebooklm']:depth>=4?['prompt','gem','file','workflow','notebooklm','approval']:Object.keys(nodeTypes);
+  const allowed=parallel?['prompt','gem','file','notebooklm']:depth>=4?['prompt','gem','file','workflow','notebooklm','approval','check']:Object.keys(nodeTypes);
   return <div className="workflow-steps">
     {nodes.map((node,i)=><section className="review-card" key={i}>
       <div className="flow-row"><label>Step {i+1}<select value={node.type} onChange={e=>onChange(nodes.map((n,index)=>index===i?createStep(e.target.value):n))}>
@@ -56,6 +57,15 @@ function StepList({nodes,onChange,state,projectId,depth=0,parallel=false,noteboo
       })()}
       {node.type==='file'&&<label>Project file<select required value={node.fileId??''} onChange={e=>patch(i,{fileId:e.target.value})}><option value="">Choose file</option>{state.files.filter(f=>projectId&&f.projectId===projectId&&!f.chatId).map(f=><option key={f.id} value={f.id}>{f.name}</option>)}</select></label>}
       {node.type==='workflow'&&<label>Workflow<select required value={node.workflowId??''} onChange={e=>patch(i,{workflowId:e.target.value})}><option value="">Choose workflow</option>{(state.workflows??[]).filter(w=>!w.projectId||w.projectId===projectId).map(w=><option key={w.id} value={w.id}>{w.name}</option>)}</select></label>}
+      {node.type==='check'&&<>
+        <label>Check rule<select value={node.rule} onChange={event=>patch(i,{rule:event.target.value,expected:''})}>
+          <option value="contains">Output contains text</option><option value="length">Minimum output length</option>
+        </select></label>
+        {node.rule==='length'?<label>Minimum characters<input required type="number" min="1" max="12000" value={node.expected}
+          onChange={event=>patch(i,{expected:event.target.value===''?'':Number(event.target.value)})}/></label>:
+          <label>Required text<input required maxLength={300} value={node.expected} onChange={event=>patch(i,{expected:event.target.value})}/></label>}
+        <p className="hint">Checks the latest saved output and blocks the run if it fails.</p>
+      </>}
       {node.type==='approval'&&<label>What should the reviewer check?<textarea required rows={3} maxLength={1000} value={node.note??''} onChange={event=>patch(i,{note:event.target.value})}/></label>}
       {node.type==='condition'&&<>
         <label>Match type<select value={node.match??'text'} onChange={event=>patch(i,{match:event.target.value})}><option value="text">Text contains</option><option value="json">JSON field equals</option></select></label>
@@ -114,7 +124,7 @@ export function WorkflowEditor({entity,state,onClose,onSave,task=false,notebook=
   return <Modal wide title={task?'Plan a Cowork task':entity?'Edit workflow':'New workflow'} onClose={onClose}>
     <form className="modal-form" onSubmit={async e=>{
       e.preventDefault();setError('');setBusy(true);
-      try{await onSave({...values,nodes:parsedWorkflowNodes(values.nodes),name:values.name.trim(),projectId:values.projectId||null,scheduleMinutes:Number(values.scheduleMinutes)||0});}
+      try{await onSave({...values,nodes:parsedWorkflowNodes(values.nodes),name:values.name.trim(),projectId:values.projectId||null,scheduleMinutes:Number(values.scheduleMinutes)||0,maxModelCalls:modelCallBudget(values.maxModelCalls??null)});}
       catch(error){setError(error.message);setBusy(false);}
     }}>
       <label>{task?'Task name':'Workflow name'}<input required autoFocus maxLength={100} value={values.name} onChange={e=>patch('name',e.target.value)}/></label>
@@ -124,6 +134,9 @@ export function WorkflowEditor({entity,state,onClose,onSave,task=false,notebook=
       <div className="scope-grid">{[['useMemory','Include scoped memory'],['cloudRouting','Allow Jev to classify step prompts'],['files','Include project files']].map(([key,label])=>
         <label className="checkbox" key={key}><input type="checkbox" checked={values[key]} onChange={e=>patch(key,e.target.checked)}/>{label}</label>)}</div>
       {values.cloudRouting&&<label className="checkbox"><input type="checkbox" checked={values.abliterated===true} onChange={e=>patch('abliterated',e.target.checked)}/>Allow Auto to select a vault Abliterated connection</label>}
+      <label>Model-call budget<input type="number" min="1" max="80" placeholder="Optional" value={values.maxModelCalls??''}
+        onChange={event=>patch('maxModelCalls',event.target.value===''?null:Number(event.target.value))}/></label>
+      <p className="hint">Caps attempts to generate prompt and Gem outputs, including retries. It does not count research, NotebookLM, or routing calls.</p>
       {!task&&<label>Run every (minutes)<input type="number" min="5" max="10080" value={values.scheduleMinutes||''} onChange={e=>patch('scheduleMinutes',e.target.value)} placeholder="Manual or API only"/></label>}
       <><label>Goal for the planner<textarea rows={4} maxLength={6000} value={goal} onChange={e=>setGoal(e.target.value)}/></label>
         <button type="button" className="button secondary" disabled={planning||!goal.trim()||values.connectionId==='auto'} onClick={plan}>{planning?'Drafting plan…':'Draft plan'}</button>
@@ -180,23 +193,27 @@ export function Jobs({onCreate,onArtifact,onSkill,initialRun=null}){
     {runs.length?<div className="pick-list">{runs.map(r=><button key={r.id} className={'pick-row'+(r.id===selected?' selected':'')} onClick={()=>{setSelected(r.id);setConfirmReplay(false);}}><span className="mini-icon"><GitBranch size={16}/></span><span><strong>{r.definition.name}</strong><small>{r.status} · {r.cursor}/{r.definition.steps.length} steps</small></span></button>)}</div>:<p className="hint">{filter==='all'?'No background runs yet.':'No runs match this filter.'}</p>}
     {run&&<section className="workspace-card run-card">
       <h2>{run.definition.name}</h2><p role="status">{run.status==='awaiting_approval'?'Awaiting approval':run.status} · {run.cursor}/{run.definition.steps.length} steps{run.definition.trigger?' · '+run.definition.trigger:''}</p>
+      {run.definition.maxModelCalls!=null&&<p>Model-call budget · {run.modelCalls} of {run.definition.maxModelCalls} reserved</p>}
       {run.status==='awaiting_approval'&&<section className="review-card"><h3>{run.definition.steps[run.cursor].label}</h3>
         <p dir="auto">{run.definition.steps[run.cursor].note}</p>
         <div className="flow-row"><button className="button primary" disabled={busy} onClick={()=>action('approve')}>Approve and continue</button>
         <button className="button secondary" disabled={busy} onClick={()=>action('reject')}>Reject and end run</button></div></section>}
       {run.definition.replayOf&&<p><button className="card-link" onClick={()=>setSelected(run.definition.replayOf)}>Open original run</button></p>}
       {confirmReplay&&<section className="review-card">
-        <p>Replay starts a new run using the recorded input and steps. It reads current project context and may make model or NotebookLM calls. Approval gates require fresh decisions.</p>
+        <p>Replay starts a new run using the recorded input and steps. It reads current project context and may make model or NotebookLM calls. Approval gates require fresh decisions. This starts with a fresh run budget.</p>
         <div className="flow-row"><button className="button primary" disabled={busy} onClick={replay}>Replay run</button>
         <button className="button secondary" disabled={busy} onClick={()=>setConfirmReplay(false)}>Cancel replay</button></div>
       </section>}
       <div className="flow-row">
-        {!confirmReplay&&['completed','cancelled'].includes(run.status)&&<button className="button secondary" onClick={()=>setConfirmReplay(true)}>Review replay</button>}
+        {!confirmReplay&&['completed','cancelled','blocked'].includes(run.status)&&<button className="button secondary" onClick={()=>setConfirmReplay(true)}>Review replay</button>}
         {run.status==='queued'&&<button className="button secondary" disabled={busy} onClick={()=>action('pause')}>Pause</button>}
         {['paused','blocked'].includes(run.status)&&<button className="button secondary" disabled={busy} onClick={()=>action('resume')}>Resume</button>}
         {['queued','running','paused','blocked','awaiting_approval'].includes(run.status)&&<button className="button secondary" disabled={busy} onClick={()=>action('cancel')}>Cancel run</button>}
       </div>
-      {run.outputs.map((output,i)=><details className="advanced run-output" key={i} open={!!output.error}><summary>{output.label||'Step'} · {output.model??output.decision??'Blocked'}</summary>{output.decision?<p>{output.decision==='approved'?'Approved':'Rejected'} · {new Date(output.decided).toLocaleString()}</p>:output.error?<p className="form-error">{output.error}</p>:<>
+      {run.outputs.map((output,i)=><details className="advanced run-output" key={i} open={!!output.error||output.check==='failed'}><summary>{output.label||'Step'} · {output.model??output.decision??output.check??'Blocked'}</summary>{output.check?<>
+        <p>{output.description}</p>{output.source&&<p>Output checked · {output.source}</p>}
+        {output.error&&<p className="form-error">{output.error}</p>}
+      </>:output.decision?<p>{output.decision==='approved'?'Approved':'Rejected'} · {new Date(output.decided).toLocaleString()}</p>:output.error?<p className="form-error">{output.error}</p>:<>
         {output.usage&&<p className="hint">{output.usage.total!=null?output.usage.total+' tokens reported':'Token count unavailable'}{output.usage.costUsd!=null?' · USD '+output.usage.costUsd:''}</p>}
         {output.sources?.length>0&&<ol className="research-results">{output.sources.map(source=><li key={source.url}>
           <a href={source.url} target="_blank" rel="noreferrer">{source.title}</a>{source.date&&<small> · {source.date}</small>}<p dir="auto">{source.excerpt}</p>

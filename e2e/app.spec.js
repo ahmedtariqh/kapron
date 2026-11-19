@@ -652,3 +652,25 @@ test('workflow trigger controls preview, schedule and queue a scoped webhook run
   await page.getByRole('button',{name:new RegExp('^'+name+' completed')}).click({timeout:17000});
   await expect(page.getByText('completed · 1/1 steps · webhook')).toBeVisible();
 });
+
+test('Cowork checks the saved output before finishing and displays model-call usage',async({page})=>{
+  const name='Checked delivery '+Date.now();
+  await page.goto('/');
+  await page.getByRole('button',{name:'Workflows',exact:true}).click();
+  await page.getByRole('button',{name:'New workflow',exact:true}).click();
+  await page.getByLabel('Workflow name').fill(name);
+  await page.getByLabel('Default connection').selectOption('demo');
+  await page.getByLabel('Model-call budget').fill('1');
+  await page.getByLabel('Prompt',{exact:true}).fill('Write the required fixture.');
+  await page.getByRole('button',{name:'Add step',exact:true}).click();
+  await page.getByRole('combobox',{name:'Step 2',exact:true}).selectOption('check');
+  await page.getByLabel('Check rule').selectOption('length');
+  await page.getByLabel('Minimum characters').fill('1');
+  await page.getByRole('button',{name:'Save workflow'}).click();
+  await page.getByRole('article').filter({hasText:name}).getByRole('button',{name:'Run workflow'}).click();
+  await page.getByRole('button',{name:'Queue run'}).click();
+  await expect(page.getByText('Check delivery · passed')).toBeVisible({timeout:17000});
+  await expect(page.getByText('Model-call budget · 1 of 1 reserved')).toBeVisible();
+  await page.getByText('Check delivery · passed').click();
+  await expect(page.getByText('Output checked · prompt')).toBeVisible();
+});

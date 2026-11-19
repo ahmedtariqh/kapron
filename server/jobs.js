@@ -63,12 +63,26 @@ export function expandWorkflow(state,definition){
   return expanded;
 }
 
+export function modelCallBudget(value){
+  if(value==null)return null;
+  if(!Number.isSafeInteger(value)||value<1||value>80)throw fail(400,'Set a model-call budget between 1 and 80.');
+  return value;
+}
+
 function normalizeStep(state,definition,node){
   const label=typeof node.label==='string'&&node.label.trim()?node.label.trim().slice(0,80):node.type;
   if(node.type==='research-search'||node.type==='research-report'){
     const key=node.type==='research-search'?'query':'question';
     if(typeof node[key]!=='string'||!node[key].trim()||node[key].length>(key==='query'?400:300))throw fail(400,'Enter a valid research '+key+'.');
     return {type:node.type,label,[key]:node[key].trim(),domains:domainPolicy(node.domains)};
+  }
+  if(node.type==='check'){
+    const checkLabel=label==='check'?'Check delivery':label;
+    if(node.rule==='contains'&&typeof node.expected==='string'&&node.expected.trim().length&&node.expected.length<=300)
+      return {type:'check',label:checkLabel,rule:'contains',expected:node.expected.trim()};
+    if(node.rule==='length'&&Number.isSafeInteger(node.expected)&&node.expected>=1&&node.expected<=12000)
+      return {type:'check',label:checkLabel,rule:'length',expected:node.expected};
+    throw fail(400,'Choose a delivery check with text or a minimum length between 1 and 12,000 characters.');
   }
   if(node.type==='approval'){
     if(typeof node.note!=='string'||!node.note.trim()||node.note.length>1000)throw fail(400,'Describe the approval in up to 1,000 characters.');
@@ -106,7 +120,8 @@ export async function prepareJob(env,owner,input){
   if(!['fixed','prefer-gem','prefer-project'].includes(input.policy))throw fail(400,'Select a background model conflict policy.');
   const connection=getConnection(state,input.connectionId);
   if(!connection || (connection.id!=='demo' && connection.id!=='auto' && connection.mode!=='vault'))throw fail(400,'Background runs require Auto, Demo, or a vault connection.');
-  return {name:String(input.name??'Run').slice(0,100),projectId:input.projectId??null,
+  const budget=modelCallBudget(input.maxModelCalls);
+  return {...(budget!==null?{maxModelCalls:budget}:{}),name:String(input.name??'Run').slice(0,100),projectId:input.projectId??null,
     kind:research?'research':input.kind==='task'?'task':'workflow',policy:input.policy,connectionId:connection.id,
     abliterated:input.abliterated===true,useMemory:input.useMemory===true,cloudRouting:input.cloudRouting===true,files:input.files===true,
     steps:expandWorkflow(state,input),input:typeof input.input==='string'?input.input.slice(0,12000):''};
@@ -152,14 +167,14 @@ async function queueDefinition(env,owner,definition,runId=crypto.randomUUID(),tr
 export async function replayJob(env,owner,id){
   const run=await getJob(env,owner,id);
   if(!run)throw fail(404,'Run unavailable.');
-  if(!['completed','cancelled'].includes(run.status))throw fail(409,'Finish or cancel this run before replaying it.');
+  if(!['completed','cancelled','blocked'].includes(run.status))throw fail(409,'Finish, cancel, or wait for a blocker before replaying this run.');
   const state=await loadWorkspace(env,owner);
   if(run.definition.projectId&&!state.projects.some(project=>project.id===run.definition.projectId))
     throw fail(409,'The run’s project is unavailable.');
   if(!getConnection(state,run.definition.connectionId))throw fail(409,'The run’s model connection is unavailable.');
   return queueDefinition(env,owner,{...run.definition,trigger:undefined,replayOf:run.id});
 }
-const hydrate=row=>row?{id:row.id,status:row.status,updated:row.updated,cursor:row.cursor,definition:JSON.parse(row.definition),outputs:JSON.parse(row.outputs)}:null;
+const hydrate=row=>row?{id:row.id,status:row.status,updated:row.updated,cursor:row.cursor,modelCalls:row.model_calls??0,definition:JSON.parse(row.definition),outputs:JSON.parse(row.outputs)}:null;
 export const getJob=async(env,owner,id)=>hydrate(await first(env,'SELECT * FROM kapron_job WHERE owner=? AND id=?',owner,id));
 const inboxFilters={
   all:'',
@@ -194,7 +209,7 @@ export async function changeJob(env,owner,id,action,stepIndex){
   return getJob(env,owner,id);
 }
 
-async function resolveStep(env,row,definition,step,previous,prior,execute,decide,search){
+async function resolveStep(env,row,lease,definition,step,previous,prior,execute,decide,search){
   const state=await loadWorkspace(env,row.owner);
   if(definition.projectId&&!state.projects.some(x=>x.id===definition.projectId))throw fail(409,'The project is unavailable.');
   if(step.type==='research-search'){
@@ -243,6 +258,11 @@ async function resolveStep(env,row,definition,step,previous,prior,execute,decide
     : getConnection(state,use.connectionId);
   if(!connection||!['demo','vault'].includes(connection.mode))throw fail(409,'The selected model has no usable background connection.');
   const model=use.connectionId==='auto'?connection.model:use.model;
+  if(definition.maxModelCalls!=null){
+    const reservation=await write(env,"UPDATE kapron_job SET model_calls=model_calls+1 WHERE owner=? AND id=? AND lease=? AND status='running' AND model_calls<?",
+      row.owner,row.id,lease,definition.maxModelCalls);
+    if(reservation.meta.changes!==1)throw fail(409,'No model-call budget remains, or this run is no longer active.');
+  }
   const resultText=await execute(env,row.owner,{connectionId:connection.id,model,...context,options:{maxOutput:2048,responseFormat:step.responseFormat,responseSchema:step.responseSchema,reportUsage:connection.capability?.reportUsage===true}});
   if(step.responseFormat==='json_object'&&resultText.text.length>12000)throw fail(422,'The JSON object exceeds the workflow output limit.');
   const {profile,...details}=routing;
@@ -252,7 +272,7 @@ async function resolveStep(env,row,definition,step,previous,prior,execute,decide
 
 async function advance(env,row,execute,decide,search){
   const lease=crypto.randomUUID();
-  const claim=await write(env,"UPDATE kapron_job SET status='running',lease=?,updated=? WHERE id=? AND status='queued'",lease,clock(),row.id);
+  const claim=await write(env,"UPDATE kapron_job SET status='running',lease=?,updated=? WHERE id=? AND cursor=? AND updated=? AND status='queued'",lease,clock(),row.id,row.cursor,row.updated);
   if(claim.meta.changes!==1)return;
   const d=JSON.parse(row.definition), outputs=JSON.parse(row.outputs);
   const step=d.steps[row.cursor];
@@ -264,6 +284,17 @@ async function advance(env,row,execute,decide,search){
     if(step.type==='approval'){
       cursor=row.cursor;
       status='awaiting_approval';
+    }else if(step.type==='check'){
+      const source=previous.at(-1);
+      const outcome=source&&(
+        step.rule==='contains'?source.text.toLowerCase().includes(step.expected.toLowerCase()):Array.from(source.text.trim()).length>=step.expected
+      );
+      const description=step.rule==='contains'?'Contains “'+step.expected+'”':'Minimum length of '+step.expected+' characters';
+      const receipt={step:row.cursor,index:0,label:step.label,check:outcome?'passed':'failed',description,
+        ...(source?{source:source.label}:{error:'The check needs a prior output.'})};
+      const priorReceipt=outputs.findIndex(output=>output.step===row.cursor&&output.index===0);
+      if(priorReceipt===-1)outputs.push(receipt);else outputs[priorReceipt]=receipt;
+      if(!outcome){status='blocked';cursor=row.cursor;}
     }else if(step.type==='jump')cursor=step.jump;
     else if(step.type==='condition'){
       const text=previous.at(-1)?.text;
@@ -274,7 +305,7 @@ async function advance(env,row,execute,decide,search){
       const results=await Promise.all(steps.map(async (child,index)=>{
         const done=outputs.find(output=>output.step===row.cursor&&output.index===index&&!output.error);
         if(done)return done;
-        try{return {...await resolveStep(env,row,d,child,previous,prior,execute,decide,search),step:row.cursor,index};}
+        try{return {...await resolveStep(env,row,lease,d,child,previous,prior,execute,decide,search),step:row.cursor,index};}
         catch(error){return {step:row.cursor,index,label:child.label,error:error.message};}
       }));
       for(const output of results){

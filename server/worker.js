@@ -579,8 +579,8 @@ async function api(request,env,path) {
     }
     if(action==='preview'&&method==='POST'){
       const plan=await prepareJob(env,owner.id,await savedWorkflow(env,owner.id,workflow));
-      return json({name:plan.name,connectionId:plan.connectionId,policy:plan.policy,steps:plan.steps.map(step=>({
-        type:step.type,label:step.label??step.type,...(step.nodes?{parallel:step.nodes.length}:{})
+      return json({name:plan.name,connectionId:plan.connectionId,policy:plan.policy,maxModelCalls:plan.maxModelCalls??null,steps:plan.steps.map(step=>({
+        type:step.type,label:step.label??step.type,...(step.nodes?{parallel:step.nodes.length}:{}),...(step.type==='check'?{rule:step.rule,expected:step.expected}:{})
       }))});
     }
   }

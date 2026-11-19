@@ -277,3 +277,11 @@ curl -X POST "$KAPRON_WEBHOOK_URL" \
 ```
 
 Apply `drizzle/0003_workflow_webhook.sql` to the shared D1 database before using the trigger controls. Deploy the same version to the scheduled Worker when using Pages so that it can process one-time schedules.
+
+### Cowork delivery checks and model-call budgets
+
+Add a **Delivery check** to inspect the latest saved output. Choose a case-insensitive required phrase or a minimum character count. Cowork saves the result and the source step. A failed check blocks later steps and leaves its source output available for review. Use **Review replay** on the blocked run to start over with the recorded input and plan.
+
+Set an optional **Model-call budget** of 1–80 in a workflow or task. Each prompt or Gem generation reserves an attempt before dispatch, including retries and parallel branches. Research, NotebookLM, and routing calls do not use this counter. Cowork shows reserved attempts, and replay starts a fresh budget.
+
+Apply `drizzle/0004_job_model_calls.sql` to the shared database before using run budgets. Upgrade both the Pages backend and scheduled Worker when hosting on Pages.

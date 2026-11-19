@@ -1,6 +1,6 @@
 const fields={
   gem:['name','description','instructions','knowledge','choice','options'],
-  workflow:['name','description','kind','projectId','policy','connectionId','useMemory','cloudRouting','abliterated','files','nodes'],
+  workflow:['name','description','kind','projectId','policy','connectionId','useMemory','cloudRouting','abliterated','files','maxModelCalls','nodes'],
   skill:['name','description','family','projectId','text','enabled']
 };
 

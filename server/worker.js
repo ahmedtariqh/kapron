@@ -14,7 +14,8 @@ import {notebookAvailable,notebookCall} from './notebooklm.js';
 import {voiceRequest} from './voice.js';
 import {mediaRequest} from './media.js';
 import {decideWithJev} from './decision-service.js';
-import {apiKeyOwner,changeJob,createApiKey,createShare,enqueueJob,getJob,listApiKeys,listJobs,listShares,loadWorkspace,replayJob,revokeApiKey,revokeShare,runIdFor,setSchedule,sharedSnapshot,tickJobs} from './jobs.js';
+import {apiKeyOwner,changeJob,createApiKey,createShare,enqueueJob,getJob,listApiKeys,listJobs,listShares,loadWorkspace,replayJob,prepareJob,revokeApiKey,revokeShare,runIdFor,setSchedule,sharedSnapshot,tickJobs} from './jobs.js';
+import {authenticateWebhook,dispatchWebhook,revokeWebhook,rotateWebhook,savedWorkflow,setOneTimeSchedule,triggerStatus} from './workflow-triggers.js';
 
 const noCache={'cache-control':'no-store','x-content-type-options':'nosniff','referrer-policy':'no-referrer'};
 class Problem extends Error { constructor(status,message){super(message);this.status=status;} }
@@ -392,6 +393,16 @@ async function integration(request,env,path){
 
 async function api(request,env,path) {
   if(path.startsWith('/api/v1/'))return integration(request,env,path);
+  const hook=path.match(/^\/api\/hooks\/([a-f0-9-]{36})$/);
+  if(hook&&request.method==='POST'){
+    if(!env.DB)throw new Problem(503,'Workspace storage unavailable.');
+    const authorized=await authenticateWebhook(env,hook[1],request.headers.get('authorization'));
+    const body=await readJson(request,50000);
+    if(!body||typeof body!=='object'||Array.isArray(body)||Object.keys(body).some(key=>key!=='input'))
+      throw new Problem(400,'Send an object with an optional input string.');
+    const queued=await dispatchWebhook(env,authorized,request.headers.get('idempotency-key'),Object.hasOwn(body,'input')?body.input:'');
+    return json(queued,202);
+  }
   const sharedDownload=path.match(/^\/api\/public-share\/([a-zA-Z0-9-]{36})\/download$/);
   if(sharedDownload&&request.method==='GET'){
     const snapshot=await sharedSnapshot(env,sharedDownload[1]);
@@ -530,7 +541,8 @@ async function api(request,env,path) {
     }catch{throw new Problem(422,'The model returned an invalid task plan. Retry or plan the steps manually.');}
     return json({nodes});
   }
-  if(path==='/api/jobs'&&method==='GET')return json({runs:await listJobs(env,owner.id)});
+  if(path==='/api/jobs'&&method==='GET')
+    return json({runs:await listJobs(env,owner.id,new URL(request.url).searchParams.get('filter')??'all')});
   if(path==='/api/jobs'&&method==='POST'){
     const input=await readJson(request,70000);
     if(!input||typeof input!=='object')throw new Problem(400,'Enter a run definition.');
@@ -548,9 +560,38 @@ async function api(request,env,path) {
     const {action,step}=await readJson(request,300)??{};
     return json(await changeJob(env,owner.id,job[1],action,step));
   }
+  const trigger=path.match(/^\/api\/workflow-triggers\/([a-zA-Z0-9-]{1,80})(?:\/(webhook|once|preview))?$/);
+  if(trigger){
+    const [,workflow,action]=trigger;
+    if(!action&&method==='GET'){
+      await savedWorkflow(env,owner.id,workflow);
+      return json(await triggerStatus(env,owner.id,workflow));
+    }
+    if(action==='webhook'&&method==='POST')return json(await rotateWebhook(env,owner.id,workflow),201);
+    if(action==='webhook'&&method==='DELETE'){
+      await revokeWebhook(env,owner.id,workflow);
+      return json({revoked:true});
+    }
+    if(action==='once'&&method==='PUT'){
+      const body=await readJson(request,1000);
+      await setOneTimeSchedule(env,owner.id,workflow,body?.at);
+      return json({saved:true});
+    }
+    if(action==='preview'&&method==='POST'){
+      const plan=await prepareJob(env,owner.id,await savedWorkflow(env,owner.id,workflow));
+      return json({name:plan.name,connectionId:plan.connectionId,policy:plan.policy,steps:plan.steps.map(step=>({
+        type:step.type,label:step.label??step.type,...(step.nodes?{parallel:step.nodes.length}:{})
+      }))});
+    }
+  }
   const schedule=path.match(/^\/api\/schedules\/([a-zA-Z0-9-]{1,80})$/);
   if(schedule&&method==='PUT'){
-    await setSchedule(env,owner.id,schedule[1]);return json({saved:true});
+    const {exists}=await setSchedule(env,owner.id,schedule[1]);
+    if(!exists){
+      await revokeWebhook(env,owner.id,schedule[1]);
+      await setOneTimeSchedule(env,owner.id,schedule[1],null);
+    }
+    return json({saved:true});
   }
   if(path==='/api/shares'&&method==='GET')return json({shares:await listShares(env,owner.id)});
   if(path==='/api/shares'&&method==='POST')return json(await createShare(env,owner.id,await readJson(request,800)),201);

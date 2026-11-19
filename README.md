@@ -261,3 +261,19 @@ Open **Research**, enter a question and review up to four search queries. Option
 Choose **JSON object** under generation settings and enter an optional object schema in chat settings, a Gem, a project, or a workflow step. The integration API accepts a `json_schema` response format. Kapron sends the schema to the selected model and validates the completed output before release. Supported keywords cover required properties, additional-property control, nested arrays and objects, scalar enums, and size or numeric bounds. A mismatch identifies the failing field and leaves the run available for correction and retry.
 
 The integrations API accepts an optional `Idempotency-Key` header on `POST /api/v1/runs`. Reuse the key when retrying the same request. Duplicate submissions return the existing run, and reusing the key for a different definition returns HTTP 409.
+
+### Workflow triggers and Cowork filters
+
+Open **Workflows → Triggers** on a saved workflow to preview its expanded steps, set or cancel one future run, or create a webhook. One-time scheduling uses the browser's local time and stores an absolute timestamp. The recurring interval continues independently. The dry run validates the workflow and previews the step sequence without queuing work or calling a model.
+
+A webhook is scoped to one saved workflow. Copy its token when creating it and keep it in the sender's secret store. Rotation replaces the URL and token. Each POST accepts an optional `input` string and requires an `Idempotency-Key` header with a stable unique value per event. Use 16 to 96 letters, digits, hyphens or underscores. The same event key and run definition return the earlier run ID. The workflow uses its saved connection and context settings. Cowork shows the source of scheduled and webhook runs, and filters attention, active and finished runs before limiting the list.
+
+```sh
+curl -X POST "$KAPRON_WEBHOOK_URL" \
+  -H "Authorization: Bearer $KAPRON_WEBHOOK_TOKEN" \
+  -H 'Idempotency-Key: order-created-0001' \
+  -H 'Content-Type: application/json' \
+  --data '{"input":"Review this new order"}'
+```
+
+Apply `drizzle/0003_workflow_webhook.sql` to the shared D1 database before using the trigger controls. Deploy the same version to the scheduled Worker when using Pages so that it can process one-time schedules.

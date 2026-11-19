@@ -8,7 +8,7 @@ import {parseDecision,routingCandidates,chooseModel} from '../server/routing.js'
 
 function fixture(overrides={}){
   const db=new DatabaseSync(':memory:');
-  for(const migration of ['0000_workspace','0001_execution','0002_model_quota']) db.exec(readFileSync('drizzle/'+migration+'.sql','utf8'));
+  for(const migration of ['0000_workspace','0001_execution','0002_model_quota','0003_workflow_webhook']) db.exec(readFileSync('drizzle/'+migration+'.sql','utf8'));
   const env={KAPRON_TRUST_SITES_IDENTITY:'1',KAPRON_VAULT_KEY:Buffer.alloc(32,4).toString('base64'),...overrides,DB:{
     prepare(sql){return {bind(...args){return {
       async first(){return db.prepare(sql).get(...args);},
@@ -607,5 +607,103 @@ test('concurrent Cowork submissions deduplicate by owner and enforce the pending
     assert.equal(parallel.filter(response=>response.status===202).length,29);
     assert.equal(parallel.filter(response=>response.status===429).length,8);
     assert.equal((await post('alice','same-request-key-01')).status,202);
+  }finally{db.close();}
+});
+
+test('workflow webhooks authorize a single saved workflow and deduplicate across rotation',async()=>{
+  const {request,db}=fixture();
+  const state=initial();
+  state.workflows=[{id:'workflow-a',name:'Send digest',policy:'fixed',connectionId:'demo',nodes:[{type:'prompt',label:'Draft digest',prompt:'Write the digest.'}]}];
+  const target='workflow-triggers/workflow-a';
+  try{
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    assert.equal((await request(target+'/webhook',{user:'bob',method:'POST'})).status,404);
+    assert.equal((await request('schedules/workflow-a',{method:'PUT'})).status,200);
+    const preview=await request(target+'/preview',{method:'POST'});
+    assert.deepEqual((await preview.json()).steps,[{type:'prompt',label:'Draft digest'}]);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM kapron_job').get().n,0);
+
+    const issue=()=>request(target+'/webhook',{method:'POST'}).then(response=>response.json());
+    const firstHook=await issue();
+    const dispatch=(hook,body={input:'Only this data'},eventKey='event-delivery-1234')=>request('hooks/'+hook.id,{
+      user:null,method:'POST',body,headers:{authorization:'Bearer '+hook.token,...(eventKey===null?{}:{'idempotency-key':eventKey})}
+    });
+    const status=await (await request(target)).json();
+    assert.equal(status.webhook.id,firstHook.id);
+    assert(!JSON.stringify(status).includes(firstHook.token));
+    assert.notEqual(db.prepare('SELECT secret_hash FROM kapron_workflow_webhook').get().secret_hash,firstHook.token);
+    assert.equal((await dispatch({...firstHook,token:'invalid'})).status,401);
+    assert.equal((await dispatch(firstHook,{input:'text',workflowId:'other'})).status,400);
+    assert.equal((await dispatch(firstHook,{input:'text'},null)).status,400);
+    const deliveries=await Promise.all(Array.from({length:6},()=>dispatch(firstHook)));
+    assert(deliveries.every(response=>response.status===202));
+    const ids=await Promise.all(deliveries.map(async response=>(await response.json()).id));
+    assert.equal(new Set(ids).size,1);
+    assert.equal((await dispatch(firstHook,{input:'Different input'})).status,409);
+    assert.equal((await request('jobs/'+ids[0],{user:'bob'})).status,404);
+    const run=await (await request('jobs/'+ids[0])).json();
+    assert.equal(run.definition.name,'Send digest');
+    assert.equal(run.definition.trigger,'webhook');
+
+    const rotated=await issue();
+    assert.equal((await dispatch(firstHook)).status,401);
+    assert.equal((await (await dispatch(rotated)).json()).id,ids[0]);
+    assert.equal((await request(target+'/webhook',{method:'DELETE'})).status,200);
+    assert.equal((await dispatch(rotated)).status,401);
+    const cleanup=await issue();
+    state.workflows=[];
+    await request('workspace',{method:'PUT',body:{state,revision:1}});
+    assert.equal((await request('schedules/workflow-a',{method:'PUT'})).status,200);
+    assert.equal((await dispatch(cleanup)).status,401);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM kapron_job').get().n,1);
+  }finally{db.close();}
+});
+
+test('one-time workflow triggers persist, cancel, and admit only one run while preserving interval schedules',async()=>{
+  const {request,tick,db}=fixture();
+  const state=initial();
+  state.workflows=[{id:'workflow-a',name:'Later report',policy:'fixed',connectionId:'demo',scheduleMinutes:5,nodes:[{type:'prompt',prompt:'Write the report.'}]}];
+  const target='workflow-triggers/workflow-a';
+  const schedule=(at,user='alice')=>request(target+'/once',{user,method:'PUT',body:{at}});
+  const count=()=>db.prepare('SELECT COUNT(*) n FROM kapron_job').get().n;
+  try{
+    await request('workspace',{method:'PUT',body:{state,revision:0}});
+    await request('schedules/workflow-a',{method:'PUT'});
+    const later=Date.now()+60000;
+    assert.equal((await schedule(later,'bob')).status,404);
+    assert.equal((await schedule(1)).status,400);
+    assert.equal((await schedule(later)).status,200);
+    let status=await (await request(target)).json();
+    assert.equal(status.oneTimeAt,later);
+    assert.equal(status.interval.minutes,5);
+    await tick();
+    assert.equal(count(),0);
+    assert.equal((await schedule(null)).status,200);
+    assert.equal((await (await request(target)).json()).oneTimeAt,null);
+    assert.equal((await schedule(later)).status,200);
+    db.prepare("UPDATE kapron_trigger SET due=? WHERE interval_ms=0").run(Date.now()-1);
+    await Promise.all([tick(),tick()]);
+    await tick();
+    assert.equal(count(),1);
+    const {runs}=await (await request('jobs')).json();
+    assert.equal(runs[0].definition.trigger,'one-time schedule');
+    status=await (await request(target)).json();
+    assert.equal(status.oneTimeAt,null);
+    assert.equal(status.interval.minutes,5);
+  }finally{db.close();}
+});
+
+test('Cowork inbox filters runs before the history limit and keeps owners isolated',async()=>{
+  const {request,db}=fixture();
+  const insert=db.prepare('INSERT INTO kapron_job(id,owner,definition,status,updated) VALUES(?,?,?,?,?)');
+  const definition=JSON.stringify({name:'Report',steps:[{type:'prompt'}]});
+  try{
+    insert.run('older-needs-attention','alice',definition,'awaiting_approval',1);
+    insert.run('other-needs-attention','bob',definition,'blocked',1);
+    for(let i=0;i<32;i++)insert.run('done-'+i,'alice',definition,'completed',i+2);
+    assert.equal((await (await request('jobs')).json()).runs.length,30);
+    const attention=await (await request('jobs?filter=attention')).json();
+    assert.deepEqual(attention.runs.map(run=>run.id),['older-needs-attention']);
+    assert.equal((await request('jobs?filter=invalid')).status,400);
   }finally{db.close();}
 });

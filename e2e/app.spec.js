@@ -610,3 +610,45 @@ test('research plans save query receipts and a filtered, deduplicated evidence r
   await report.getByRole('button',{name:'Open in Canvas'}).click();
   await expect(page.getByRole('dialog').getByLabel('Content')).toHaveValue(/## Evidence excerpts/);
 });
+
+test('workflow trigger controls preview, schedule and queue a scoped webhook run',async({page})=>{
+  const name='Trigger workflow '+Date.now();
+  await page.goto('/');
+  await page.getByRole('button',{name:'Workflows',exact:true}).click();
+  await page.getByRole('button',{name:'New workflow',exact:true}).click();
+  await page.getByLabel('Workflow name').fill(name);
+  await page.getByLabel('Default connection').selectOption('demo');
+  await page.getByLabel('Prompt',{exact:true}).fill('Create an event checklist.');
+  await page.getByRole('button',{name:'Save workflow'}).click();
+  const card=page.getByRole('article').filter({hasText:name});
+  await card.getByRole('button',{name:'Triggers',exact:true}).click();
+  const dialog=page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'Workflow triggers',exact:true})});
+  await dialog.getByRole('button',{name:'Dry-run plan'}).click();
+  await expect(dialog.getByText('Connection demo · fixed policy')).toBeVisible();
+  const future=await page.evaluate(()=>{
+    const time=new Date(Date.now()+86400000);
+    return new Date(time.getTime()-time.getTimezoneOffset()*60000).toISOString().slice(0,16);
+  });
+  await dialog.getByLabel('One-time run (local time)').fill(future);
+  await dialog.getByRole('button',{name:'Schedule once'}).click();
+  await expect(dialog.getByText('One-time schedule saved.')).toBeVisible();
+  await dialog.getByRole('button',{name:'Cancel one-time run'}).click();
+  await expect(dialog.getByText('One-time schedule canceled.')).toBeVisible();
+
+  await dialog.getByRole('button',{name:'Create webhook'}).click();
+  const hook=dialog.getByLabel('Webhook URL'), token=dialog.getByLabel(/Webhook token/);
+  await expect(token).toHaveValue(/^kapron_hook_/);
+  const delivery={headers:{authorization:'Bearer '+await token.inputValue(),'idempotency-key':'external-event-1234'},data:{input:'Fixture event'}};
+  const url=await hook.inputValue();
+  const response=await page.request.post(url,delivery);
+  expect(response.status()).toBe(202);
+  expect((await response.json()).id).toMatch(/^request-/);
+  await dialog.getByRole('button',{name:'Revoke webhook'}).click();
+  await expect(dialog.getByText('Webhook revoked.')).toBeVisible();
+  expect((await page.request.post(url,delivery)).status()).toBe(401);
+  await page.keyboard.press('Escape');
+  await page.getByRole('button',{name:'Cowork',exact:true}).click();
+  await page.getByLabel('Filter runs').selectOption('finished');
+  await page.getByRole('button',{name:new RegExp('^'+name+' completed')}).click({timeout:17000});
+  await expect(page.getByText('completed · 1/1 steps · webhook')).toBeVisible();
+});

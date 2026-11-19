@@ -97,7 +97,7 @@ export async function loadWorkspace(env,owner){
   return row?JSON.parse(row.document):initial();
 }
 
-export async function enqueueJob(env,owner,input,runId=crypto.randomUUID()){
+export async function prepareJob(env,owner,input){
   const research=input.kind==='research';
   if(research)input={kind:'research',name:typeof input.question==='string'?input.question.trim():'',projectId:input.projectId,policy:'fixed',
     connectionId:'demo',nodes:researchNodes(input)};
@@ -106,18 +106,22 @@ export async function enqueueJob(env,owner,input,runId=crypto.randomUUID()){
   if(!['fixed','prefer-gem','prefer-project'].includes(input.policy))throw fail(400,'Select a background model conflict policy.');
   const connection=getConnection(state,input.connectionId);
   if(!connection || (connection.id!=='demo' && connection.id!=='auto' && connection.mode!=='vault'))throw fail(400,'Background runs require Auto, Demo, or a vault connection.');
-  const definition={name:String(input.name??'Run').slice(0,100),projectId:input.projectId??null,
+  return {name:String(input.name??'Run').slice(0,100),projectId:input.projectId??null,
     kind:research?'research':input.kind==='task'?'task':'workflow',policy:input.policy,connectionId:connection.id,
     abliterated:input.abliterated===true,useMemory:input.useMemory===true,cloudRouting:input.cloudRouting===true,files:input.files===true,
     steps:expandWorkflow(state,input),input:typeof input.input==='string'?input.input.slice(0,12000):''};
-  return queueDefinition(env,owner,definition,runId);
+}
+export async function enqueueJob(env,owner,input,runId,trigger){
+  const definition=await prepareJob(env,owner,input);
+  if(trigger)definition.trigger=trigger.webhookId?'webhook':trigger.interval_ms===0?'one-time schedule':'interval schedule';
+  return queueDefinition(env,owner,definition,runId,trigger);
 }
 export async function runIdFor(owner,key){
   if(key===null)return undefined;
   if(typeof key!=='string'||!/^[a-zA-Z0-9_-]{16,96}$/.test(key))throw fail(400,'Use an idempotency key of 16 to 96 letters, digits, hyphens, or underscores.');
   return 'request-'+await digest(JSON.stringify([owner,key]));
 }
-async function queueDefinition(env,owner,definition,runId=crypto.randomUUID()){
+async function queueDefinition(env,owner,definition,runId=crypto.randomUUID(),trigger){
   const serialized=JSON.stringify(definition);
   const findExisting=async()=>{
     const current=await first(env,'SELECT definition,status FROM kapron_job WHERE owner=? AND id=?',owner,runId);
@@ -132,13 +136,17 @@ async function queueDefinition(env,owner,definition,runId=crypto.randomUUID()){
   }
   const usesNotebook=definition.steps.some(step=>step.type==='notebooklm'||step.nodes?.some(x=>x.type==='notebooklm'));
   if(usesNotebook&&!notebookAvailable(env,owner))throw fail(409,'Connect NotebookLM before queuing this run.');
+  const validTrigger=trigger?.webhookId?' AND EXISTS (SELECT 1 FROM kapron_workflow_webhook WHERE id=? AND owner=?)':
+    trigger?.id?' AND EXISTS (SELECT 1 FROM kapron_trigger WHERE id=? AND owner=? AND due=?)':'';
+  const triggerArgs=trigger?.webhookId?[trigger.webhookId,owner]:trigger?.id?[trigger.id,owner,trigger.due]:[];
   const inserted=await write(env,`INSERT OR IGNORE INTO kapron_job(id,owner,definition,status,updated)
     SELECT ?,?,?,'queued',? WHERE (SELECT COUNT(*) FROM kapron_job WHERE owner=?
-      AND status IN ('queued','running','paused','blocked','awaiting_approval'))<30`,
-    runId,owner,serialized,clock(),owner);
+      AND status IN ('queued','running','paused','blocked','awaiting_approval'))<30`+validTrigger,
+    runId,owner,serialized,clock(),owner,...triggerArgs);
   if(inserted.meta.changes===1)return {id:runId,status:'queued'};
   const existing=await findExisting();
   if(existing)return existing;
+  if(trigger&&!(await first(env,'SELECT 1 AS valid WHERE 1=1'+validTrigger,...triggerArgs)))throw fail(409,'Trigger expired or was replaced.');
   throw fail(429,'Your workspace has 30 pending runs. Finish or cancel a run first.');
 }
 export async function replayJob(env,owner,id){
@@ -149,11 +157,20 @@ export async function replayJob(env,owner,id){
   if(run.definition.projectId&&!state.projects.some(project=>project.id===run.definition.projectId))
     throw fail(409,'The run’s project is unavailable.');
   if(!getConnection(state,run.definition.connectionId))throw fail(409,'The run’s model connection is unavailable.');
-  return queueDefinition(env,owner,{...run.definition,replayOf:run.id});
+  return queueDefinition(env,owner,{...run.definition,trigger:undefined,replayOf:run.id});
 }
 const hydrate=row=>row?{id:row.id,status:row.status,updated:row.updated,cursor:row.cursor,definition:JSON.parse(row.definition),outputs:JSON.parse(row.outputs)}:null;
 export const getJob=async(env,owner,id)=>hydrate(await first(env,'SELECT * FROM kapron_job WHERE owner=? AND id=?',owner,id));
-export const listJobs=async(env,owner)=>(await list(env,'SELECT * FROM kapron_job WHERE owner=? ORDER BY updated DESC LIMIT 30',owner)).map(hydrate);
+const inboxFilters={
+  all:'',
+  attention:" AND status IN ('awaiting_approval','blocked','paused')",
+  active:" AND status IN ('queued','running')",
+  finished:" AND status IN ('completed','cancelled')"
+};
+export async function listJobs(env,owner,filter='all'){
+  if(!Object.hasOwn(inboxFilters,filter))throw fail(400,'Choose a valid run filter.');
+  return (await list(env,'SELECT * FROM kapron_job WHERE owner=?'+inboxFilters[filter]+' ORDER BY updated DESC LIMIT 30',owner)).map(hydrate);
+}
 export async function changeJob(env,owner,id,action,stepIndex){
   if(action==='approve'||action==='reject'){
     if(!Number.isSafeInteger(stepIndex)||stepIndex<0)throw fail(400,'Select the approval step.');
@@ -282,10 +299,14 @@ export async function tickJobs(env,execute,decide,search){
   const triggers=await list(env,'SELECT * FROM kapron_trigger WHERE due<=? ORDER BY due LIMIT 4',clock());
   for(const trigger of triggers){
     const workspace=await loadWorkspace(env,trigger.owner);
-    const workflow=(workspace.workflows??[]).find(x=>x.id===trigger.workflow&&x.scheduleMinutes*60000===trigger.interval_ms);
+    const workflow=(workspace.workflows??[]).find(x=>x.id===trigger.workflow&&(trigger.interval_ms===0||x.scheduleMinutes*60000===trigger.interval_ms));
     if(workflow){
       const runId='schedule-'+await digest(trigger.id+':'+trigger.due);
-      try{await enqueueJob(env,trigger.owner,workflow,runId);}catch(error){if(!error.status)throw error;if(error.status===429)continue;}
+      try{await enqueueJob(env,trigger.owner,workflow,runId,trigger);}catch(error){if(!error.status)throw error;if(error.status===429)continue;}
+      if(trigger.interval_ms===0){
+        await write(env,'DELETE FROM kapron_trigger WHERE id=? AND due=?',trigger.id,trigger.due);
+        continue;
+      }
       const next=trigger.due+Math.max(1,Math.floor((clock()-trigger.due)/trigger.interval_ms)+1)*trigger.interval_ms;
       await write(env,'UPDATE kapron_trigger SET due=? WHERE id=? AND due=?',next,trigger.id,trigger.due);
     }else await write(env,'DELETE FROM kapron_trigger WHERE id=? AND due=?',trigger.id,trigger.due);
@@ -300,11 +321,15 @@ export async function setSchedule(env,owner,workflowId){
   const workflow=(workspace.workflows??[]).find(w=>w.id===workflowId);
   const id=owner+':'+workflowId;
   const minutes=workflow?.scheduleMinutes;
-  if(!minutes){await write(env,'DELETE FROM kapron_trigger WHERE id=? AND owner=?',id,owner);return;}
+  if(!minutes){
+    await write(env,'DELETE FROM kapron_trigger WHERE id=? AND owner=?',id,owner);
+    return {exists:!!workflow};
+  }
   if(!Number.isInteger(minutes)||minutes<5||minutes>10080)throw fail(400,'Choose a schedule interval between 5 and 10,080 minutes.');
   const interval=minutes*60000;
   await write(env,'INSERT INTO kapron_trigger(id,owner,workflow,interval_ms,due) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET interval_ms=excluded.interval_ms,due=excluded.due',
     id,owner,workflowId,interval,clock()+interval);
+  return {exists:true};
 }
 
 export async function createShare(env,owner,input){
@@ -329,7 +354,7 @@ export async function sharedSnapshot(env,id){
 export const listShares=(env,owner)=>list(env,'SELECT id,expires FROM kapron_share WHERE owner=? AND expires>? ORDER BY expires DESC',owner,clock());
 export const revokeShare=(env,owner,id)=>write(env,'DELETE FROM kapron_share WHERE id=? AND owner=?',id,owner);
 
-const digest=async value=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value))),b=>b.toString(16).padStart(2,'0')).join('');
+export const digest=async value=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value))),b=>b.toString(16).padStart(2,'0')).join('');
 export async function createApiKey(env,owner){
   const value='kapron_'+crypto.randomUUID()+crypto.randomUUID(), expires=clock()+30*86400000;
   const hash=await digest(value);

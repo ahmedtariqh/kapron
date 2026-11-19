@@ -136,17 +136,19 @@ export function WorkflowEditor({entity,state,onClose,onSave,task=false,notebook=
 }
 
 export function Jobs({onCreate,onArtifact,onSkill,initialRun=null}){
+  const [filter,setFilter]=useState('all');
   const [runs,setRuns]=useState([]),[error,setError]=useState(''),[selected,setSelected]=useState(initialRun),[older,setOlder]=useState(null),[busy,setBusy]=useState(false);
   useEffect(()=>{
     const controller=new AbortController();
     async function poll(){
-      try{const result=await get('jobs',{signal:controller.signal});setRuns(result.runs);setError('');}
+      try{const result=await get('jobs?filter='+filter,{signal:controller.signal});
+        if(!controller.signal.aborted){setRuns(result.runs);setError('');}}
       catch(error){if(!controller.signal.aborted)setError(error.message);}
     }
     poll();
     const timer=setInterval(poll,2500);
     return ()=>{clearInterval(timer);controller.abort();};
-  },[]);
+  },[filter]);
   useEffect(()=>{
     if(!selected||runs.some(item=>item.id===selected)||older?.id===selected)return;
     const controller=new AbortController();
@@ -172,9 +174,12 @@ export function Jobs({onCreate,onArtifact,onSkill,initialRun=null}){
   }
   return <><div className="page-heading"><span className="page-icon"><Play size={22}/></span><div><h1>Cowork & runs</h1><p>Check background progress and review completed outputs.</p></div><button className="button primary" onClick={onCreate}><Plus size={17}/>New task</button></div>
     {error&&<p className="form-error" role="alert">{error}</p>}
-    {runs.length?<div className="pick-list">{runs.map(r=><button key={r.id} className={'pick-row'+(r.id===selected?' selected':'')} onClick={()=>{setSelected(r.id);setConfirmReplay(false);}}><span className="mini-icon"><GitBranch size={16}/></span><span><strong>{r.definition.name}</strong><small>{r.status} · {r.cursor}/{r.definition.steps.length} steps</small></span></button>)}</div>:<p className="hint">No background runs yet.</p>}
+    <label>Filter runs<select value={filter} onChange={event=>{
+      setFilter(event.target.value);setRuns([]);setSelected(null);setOlder(null);setConfirmReplay(false);
+    }}><option value="all">All runs</option><option value="attention">Needs attention</option><option value="active">Active</option><option value="finished">Finished</option></select></label>
+    {runs.length?<div className="pick-list">{runs.map(r=><button key={r.id} className={'pick-row'+(r.id===selected?' selected':'')} onClick={()=>{setSelected(r.id);setConfirmReplay(false);}}><span className="mini-icon"><GitBranch size={16}/></span><span><strong>{r.definition.name}</strong><small>{r.status} · {r.cursor}/{r.definition.steps.length} steps</small></span></button>)}</div>:<p className="hint">{filter==='all'?'No background runs yet.':'No runs match this filter.'}</p>}
     {run&&<section className="workspace-card run-card">
-      <h2>{run.definition.name}</h2><p role="status">{run.status==='awaiting_approval'?'Awaiting approval':run.status} · {run.cursor}/{run.definition.steps.length} steps</p>
+      <h2>{run.definition.name}</h2><p role="status">{run.status==='awaiting_approval'?'Awaiting approval':run.status} · {run.cursor}/{run.definition.steps.length} steps{run.definition.trigger?' · '+run.definition.trigger:''}</p>
       {run.status==='awaiting_approval'&&<section className="review-card"><h3>{run.definition.steps[run.cursor].label}</h3>
         <p dir="auto">{run.definition.steps[run.cursor].note}</p>
         <div className="flow-row"><button className="button primary" disabled={busy} onClick={()=>action('approve')}>Approve and continue</button>

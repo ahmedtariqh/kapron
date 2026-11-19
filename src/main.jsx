@@ -13,6 +13,7 @@ import {ResourceEditor,RoutingSettings} from './resources.jsx';
 import {expandWorkflow} from '../server/jobs.js';
 import {Research} from './research.jsx';
 import {Jobs,WorkflowEditor} from './workflows.jsx';
+import {WorkflowTriggers} from './workflow-triggers.jsx';
 import {ArtifactEditor,ShareControls,SharedView} from './artifacts.jsx';
 import {formatSources,searchSources,Studio} from './studio.jsx';
 import {Collaboration} from './collaboration.jsx';
@@ -691,7 +692,7 @@ function Workspace(){
           {project&&<button className="button secondary" onClick={()=>setDialog({type:'project-file',project})}>Add project file</button>}
           <CardGrid items={state.workflows??[]} Icon={GitBranch} emptyTitle="Create a workflow" emptyDescription="Start with a prompt and add steps as needed." onCreate={()=>setDialog({type:'workflow'})} onEdit={entity=>setDialog({type:'workflow',entity})} onRemove={entity=>askRemove('workflow',entity)}
             detail={w=>'v'+w.version+(w.scheduleMinutes?' · Every '+w.scheduleMinutes+' min':' · Manual or API')} action="Run workflow" onOpen={w=>setDialog({type:'workflow-run',entity:w})}
-            onExtra={entity=>setDialog({type:'revisions',kind:'workflow',entity})} extraLabel="Workflow versions" /></>}
+            onExtra={entity=>setDialog({type:'revisions',kind:'workflow',entity})} extraLabel="Workflow versions" onTriggers={entity=>setDialog({type:'workflow-triggers',entity})}/></>}
         {view==='shared'&&<Collaboration/>}
         {view==='research'&&<Research state={state} onQueue={queueJob} onSearchSettings={()=>navigate('studio')}/>}
         {view==='studio'&&<Studio state={state} user={user} vaultAvailable={session.vaultAvailable} onArtifact={(name,text)=>setDialog({type:'artifact',entity:{name,text}})}/>}
@@ -753,6 +754,7 @@ function Workspace(){
     {dialog?.type==='review'&&<RunReview state={state} chat={dialog.chat} gems={dialog.gems} mode={dialog.mode} prompt={dialog.prompt} forcedChoice={dialog.forcedChoice} initialScope={dialog.initialScope} onClose={close} onRun={rows=>run(dialog,rows)}/>}
     {dialog?.type==='rerun'&&<ResponseEditor state={state} message={dialog.message} retry={dialog.retry} onClose={close} onRerun={(choice,options)=>rerunReply(dialog.message,choice,options,dialog.retry)}/>}
     {dialog?.type==='defaults'&&<Defaults state={state} onClose={close} onSave={async values=>{await persist(s=>({...s,settings:{...s.settings,...values}}));close();show('Default model updated');}}/>}
+    {dialog?.type==='workflow-triggers'&&<WorkflowTriggers workflow={dialog.entity} onClose={close}/>}
     {dialog?.type==='workflow'&&<WorkflowEditor state={state} entity={dialog.entity} onClose={close} onSave={values=>saveWorkflow(dialog.entity,values)}/>}
     {dialog?.type==='workflow-run'&&<WorkflowRunDialog entity={dialog.entity} onClose={close} onRun={input=>queueJob({...dialog.entity,input})}/>}
     {dialog?.type==='task'&&<WorkflowEditor task notebook={dialog.notebook} state={state} onClose={close} onSave={queueJob}/>}
@@ -897,9 +899,9 @@ function RunDetails({message:m}){
     </dl></div>;
 }
 function PageTitle({Icon,label,title,description,action,onAction}){return <div className="page-heading"><span className="page-icon"><Icon size={23}/></span><div><p className="eyebrow">{label}</p><h1>{title}</h1><p>{description}</p></div><button className="button primary" onClick={onAction}><Plus size={17}/>{action}</button></div>;}
-function CardGrid({items,Icon,emptyTitle,emptyDescription,onCreate,onEdit,onRemove,detail,description,action,onOpen,onExtra,extraLabel}){
+function CardGrid({items,Icon,emptyTitle,emptyDescription,onCreate,onEdit,onRemove,detail,description,action,onOpen,onExtra,extraLabel,onTriggers}){
   if(!items.length)return <button className="empty-card" onClick={onCreate}><span className="page-icon"><Plus size={21}/></span><strong>{emptyTitle}</strong><small>{emptyDescription}</small><ArrowRight size={17}/></button>;
-  return <div className="card-grid">{items.map(item=><article className="workspace-card" key={item.id}><div className="card-head"><span className="mini-icon"><Icon size={19}/></span><span className="push"/><IconButton label={'Edit '+item.name} Icon={Pencil} onClick={()=>onEdit(item)}/><IconButton label={'Delete '+item.name} Icon={Trash2} onClick={()=>onRemove(item)}/></div><h2>{item.name}</h2><p>{description?.(item)||item.description||''}</p>{detail&&<small>{detail(item)}</small>}{onOpen&&<button className="card-link" onClick={()=>onOpen(item)}>{action}<ArrowRight size={16}/></button>}{onExtra&&<button className="card-link" onClick={()=>onExtra(item)}>{extraLabel}</button>}</article>)}</div>;
+  return <div className="card-grid">{items.map(item=><article className="workspace-card" key={item.id}><div className="card-head"><span className="mini-icon"><Icon size={19}/></span><span className="push"/><IconButton label={'Edit '+item.name} Icon={Pencil} onClick={()=>onEdit(item)}/><IconButton label={'Delete '+item.name} Icon={Trash2} onClick={()=>onRemove(item)}/></div><h2>{item.name}</h2><p>{description?.(item)||item.description||''}</p>{detail&&<small>{detail(item)}</small>}{onOpen&&<button className="card-link" onClick={()=>onOpen(item)}>{action}<ArrowRight size={16}/></button>}{onExtra&&<button className="card-link" onClick={()=>onExtra(item)}>{extraLabel}</button>}{onTriggers&&<button className="card-link" onClick={()=>onTriggers(item)}>Triggers</button>}</article>)}</div>;
 }
 function Defaults({state,onClose,onSave}){
   const [choice,setChoice]=useState(state.settings.defaultChoice);

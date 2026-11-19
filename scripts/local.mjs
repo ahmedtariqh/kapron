@@ -10,7 +10,7 @@ mkdirSync(localDir,{recursive:true,mode:0o700});
 const db=new DatabaseSync(join(localDir,'workspace.sqlite'));
 db.exec('PRAGMA journal_mode=WAL');
 db.exec('CREATE TABLE IF NOT EXISTS kapron_migration (id TEXT PRIMARY KEY)');
-for(const migration of ['0000_workspace','0001_execution','0002_model_quota']){
+for(const migration of ['0000_workspace','0001_execution','0002_model_quota','0003_workflow_webhook']){
   const id=migration.slice(0,4);
   if(db.prepare('SELECT id FROM kapron_migration WHERE id=?').get(id))continue;
   db.exec('BEGIN');
